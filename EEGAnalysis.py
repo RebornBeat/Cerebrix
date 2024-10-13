@@ -543,61 +543,66 @@ class EEGAnalysis(QObject):
         sample_counts = {}
         
         if not self.actions:
-            self.log_and_emit("No actions or data available.")
+            self.log_and_emit("No actions available.")
             return
 
-        for action in self.actions:
-            if action not in self.data:
-                self.log_and_emit(f"Warning: No data found for action '{action}'")
+        for data_type in self.data.keys():
+            self.log_and_emit(f"\nChecking {data_type}:")
+            shapes[data_type] = {}
+            sample_counts[data_type] = {}
+            
+            for action in self.actions:
+                if action not in self.data[data_type]:
+                    self.log_and_emit(f"  Warning: No data found for action '{action}' in {data_type}")
+                    continue
+                shapes[data_type][action] = [sample.shape for sample in self.data[data_type][action]]
+                sample_counts[data_type][action] = len(shapes[data_type][action])
+
+            if not shapes[data_type]:
+                self.log_and_emit(f"  No valid data found for any action in {data_type}")
                 continue
-            shapes[action] = [sample.shape for sample in self.data[action]]
-            sample_counts[action] = len(shapes[action])
 
-        if not shapes:
-            self.log_and_emit("No valid data found for any action.")
-            return
+            # Summarize shape information
+            for action, action_shapes in shapes[data_type].items():
+                unique_shapes = set(action_shapes)
+                if len(unique_shapes) == 1:
+                    self.log_and_emit(f"  {action}: All {sample_counts[data_type][action]} samples have shape {unique_shapes.pop()}")
+                else:
+                    self.log_and_emit(f"  {action}: {sample_counts[data_type][action]} samples with {len(unique_shapes)} different shapes")
+                    self.log_and_emit(f"    Most common shape: {max(set(action_shapes), key=action_shapes.count)}")
+                    self.log_and_emit(f"    Unusual shapes:")
+                    for shape in unique_shapes:
+                        if action_shapes.count(shape) < 5:  # Arbitrary threshold for "unusual"
+                            self.log_and_emit(f"      {shape}: {action_shapes.count(shape)} occurrences")
 
-        # Summarize shape information
-        for action, action_shapes in shapes.items():
-            unique_shapes = set(action_shapes)
-            if len(unique_shapes) == 1:
-                self.log_and_emit(f"{action}: All {sample_counts[action]} samples have shape {unique_shapes.pop()}")
+            # Check if all actions have the same number of samples
+            if len(set(sample_counts[data_type].values())) > 1:
+                self.log_and_emit(f"\n  Inconsistent number of samples across actions in {data_type}:")
+                for action, count in sample_counts[data_type].items():
+                    self.log_and_emit(f"    {action}: {count} samples")
+            elif sample_counts[data_type]:
+                self.log_and_emit(f"\n  All actions in {data_type} have {next(iter(sample_counts[data_type].values()))} samples")
             else:
-                self.log_and_emit(f"{action}: {sample_counts[action]} samples with {len(unique_shapes)} different shapes")
-                self.log_and_emit(f"  Most common shape: {max(set(action_shapes), key=action_shapes.count)}")
-                self.log_and_emit(f"  Unusual shapes:")
-                for shape in unique_shapes:
-                    if action_shapes.count(shape) < 5:  # Arbitrary threshold for "unusual"
-                        self.log_and_emit(f"    {shape}: {action_shapes.count(shape)} occurrences")
+                self.log_and_emit(f"\n  No sample count information available for {data_type}")
 
-        # Check if all actions have the same number of samples
-        if len(set(sample_counts.values())) > 1:
-            self.log_and_emit("\nInconsistent number of samples across actions:")
-            for action, count in sample_counts.items():
-                self.log_and_emit(f"  {action}: {count} samples")
-        elif sample_counts:
-            self.log_and_emit(f"\nAll actions have {next(iter(sample_counts.values()))} samples")
-        else:
-            self.log_and_emit("\nNo sample count information available.")
+            # Overall statistics for this data type
+            all_shapes = [shape for shapes_list in shapes[data_type].values() for shape in shapes_list]
+            total_samples = sum(sample_counts[data_type].values())
+            
+            if total_samples > 0:
+                standard_shape = (250, 16, 60)
+                standard_count = all_shapes.count(standard_shape)
 
-        # Overall statistics
-        all_shapes = [shape for shapes_list in shapes.values() for shape in shapes_list]
-        total_samples = sum(sample_counts.values())
-        
-        if total_samples > 0:
-            standard_shape = (250, 16, 60)
-            standard_count = all_shapes.count(standard_shape)
-
-            self.log_and_emit(f"\nTotal samples: {total_samples}")
-            self.log_and_emit(f"Samples with standard shape {standard_shape}: {standard_count} ({standard_count/total_samples*100:.2f}%)")
-            self.log_and_emit(f"Samples with non-standard shapes: {total_samples - standard_count} ({(total_samples - standard_count)/total_samples*100:.2f}%)")
-        else:
-            self.log_and_emit("\nNo samples found in the dataset.")
+                self.log_and_emit(f"\n  Total samples in {data_type}: {total_samples}")
+                self.log_and_emit(f"  Samples with standard shape {standard_shape}: {standard_count} ({standard_count/total_samples*100:.2f}%)")
+                self.log_and_emit(f"  Samples with non-standard shapes: {total_samples - standard_count} ({(total_samples - standard_count)/total_samples*100:.2f}%)")
+            else:
+                self.log_and_emit(f"\n  No samples found in {data_type}")
 
     def clean_and_balance_data(self):
         self.log_and_emit("Cleaning and balancing data...")
-        if not self.actions or not self.data:
-            self.log_and_emit("No data available to clean and balance.")
+        if not self.actions or not self.data['raw_data']:
+            self.log_and_emit("No raw data available to clean and balance.")
             return
 
         cleaned_data = {}
@@ -605,10 +610,10 @@ class EEGAnalysis(QObject):
 
         # Step 1: Remove non-standard shapes
         for action in self.actions:
-            if action not in self.data:
-                self.log_and_emit(f"No data found for action: {action}")
+            if action not in self.data['raw_data']:
+                self.log_and_emit(f"No raw data found for action: {action}")
                 continue
-            cleaned_data[action] = [sample for sample in self.data[action] if sample.shape == (250, 16, 60)]
+            cleaned_data[action] = [sample for sample in self.data['raw_data'][action] if sample.shape == (250, 16, 60)]
             sample_counts[action] = len(cleaned_data[action])
             self.log_and_emit(f"{action}: {sample_counts[action]} samples after cleaning")
 
@@ -627,8 +632,8 @@ class EEGAnalysis(QObject):
                 cleaned_data[action] = [cleaned_data[action][i] for i in indices]
             self.log_and_emit(f"{action}: {len(cleaned_data[action])} samples after balancing")
 
-        # Update the framework's data
-        self.data = cleaned_data
+        # Update the framework's cleaned data
+        self.data['cleaned_data'] = cleaned_data
 
         # Verify the results
         shapes = {action: [sample.shape for sample in cleaned_data[action]] for action in cleaned_data}
@@ -638,6 +643,8 @@ class EEGAnalysis(QObject):
             self.log_and_emit(f"{action}:")
             for shape, count in shape_counts.items():
                 self.log_and_emit(f"  Shape {shape}: {count} samples")
+
+        self.log_and_emit("Data cleaning and balancing completed.")
 
     def run_analysis(self):
         self.log_and_emit("Loading data...")

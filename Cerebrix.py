@@ -458,8 +458,11 @@ class EEGAnalysisGUI(QMainWindow):
         QMessageBox.information(self, "Success", "EEG data collection completed.")
 
     def clean_and_balance_data(self):
+        if not self.framework.data['raw_data']:
+            QMessageBox.warning(self, "No Data", "No raw data available. Please load data first.")
+            return
+
         self.clean_data_btn.setEnabled(False)
-        self.framework.load_data()
         self.processing_thread = DataProcessingThread(self.framework)
         self.processing_thread.finished.connect(self.on_processing_finished)
         self.processing_thread.start()
