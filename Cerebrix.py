@@ -331,8 +331,12 @@ class EEGAnalysisGUI(QMainWindow):
                 self.update_log("No preprocessed data available. Showing cleaned or raw data.")
                 self.visualize_data_for_tab("Cleaned Data")
         elif tab_name == "Validation Data":
-            self.update_log("Visualization not available for validation data.")
-            self.clear_visualizations()
+            validation_data_dir = os.path.join(self.data_dir, "validation_data")
+            if os.path.exists(validation_data_dir) and os.listdir(validation_data_dir):
+                self.visualize_data(self.framework.data, "Validation")  # Assuming validation data is stored in self.framework.data
+            else:
+                self.update_log("No validation data available.")
+                self.clear_visualizations()
 
     def visualize_data(self, data, data_type):
         if not data or not self.framework.actions:
@@ -421,11 +425,13 @@ class EEGAnalysisGUI(QMainWindow):
     def clear_visualizations(self):
         if hasattr(self, 'anim'):
             self.anim.event_source.stop()
-        self.plot_2d.fig.clear()
-        self.plot_2d.draw()
+        self.plot_2d.canvas.figure.clear()
+        self.plot_2d.canvas.draw()
         self.fig_3d.clear()
         self.ax_3d = None
         self.canvas_3d.draw()
+        self.explanation_2d.clear()
+        self.explanation_3d.clear()
 
     def collect_eeg_data(self):
         action, ok = QInputDialog.getText(self, "Collect EEG Data", "Enter action name:")
