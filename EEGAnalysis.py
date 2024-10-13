@@ -497,9 +497,21 @@ class EEGAnalysis(QObject):
         self.log_and_emit("Data Consistency Summary:")
         shapes = {}
         sample_counts = {}
+        
+        if not self.actions:
+            self.log_and_emit("No actions or data available.")
+            return
+
         for action in self.actions:
+            if action not in self.data:
+                self.log_and_emit(f"Warning: No data found for action '{action}'")
+                continue
             shapes[action] = [sample.shape for sample in self.data[action]]
             sample_counts[action] = len(shapes[action])
+
+        if not shapes:
+            self.log_and_emit("No valid data found for any action.")
+            return
 
         # Summarize shape information
         for action, action_shapes in shapes.items():
@@ -519,33 +531,52 @@ class EEGAnalysis(QObject):
             self.log_and_emit("\nInconsistent number of samples across actions:")
             for action, count in sample_counts.items():
                 self.log_and_emit(f"  {action}: {count} samples")
+        elif sample_counts:
+            self.log_and_emit(f"\nAll actions have {next(iter(sample_counts.values()))} samples")
         else:
-            self.log_and_emit(f"\nAll actions have {list(sample_counts.values())[0]} samples")
+            self.log_and_emit("\nNo sample count information available.")
 
         # Overall statistics
         all_shapes = [shape for shapes_list in shapes.values() for shape in shapes_list]
         total_samples = sum(sample_counts.values())
-        standard_shape = (250, 16, 60)
-        standard_count = all_shapes.count(standard_shape)
+        
+        if total_samples > 0:
+            standard_shape = (250, 16, 60)
+            standard_count = all_shapes.count(standard_shape)
 
-        self.log_and_emit(f"\nTotal samples: {total_samples}")
-        self.log_and_emit(f"Samples with standard shape {standard_shape}: {standard_count} ({standard_count/total_samples*100:.2f}%)")
-        self.log_and_emit(f"Samples with non-standard shapes: {total_samples - standard_count} ({(total_samples - standard_count)/total_samples*100:.2f}%)")
+            self.log_and_emit(f"\nTotal samples: {total_samples}")
+            self.log_and_emit(f"Samples with standard shape {standard_shape}: {standard_count} ({standard_count/total_samples*100:.2f}%)")
+            self.log_and_emit(f"Samples with non-standard shapes: {total_samples - standard_count} ({(total_samples - standard_count)/total_samples*100:.2f}%)")
+        else:
+            self.log_and_emit("\nNo samples found in the dataset.")
 
     def clean_and_balance_data(self):
         self.log_and_emit("Cleaning and balancing data...")
+        if not self.actions or not self.data:
+            self.log_and_emit("No data available to clean and balance.")
+            return
+
         cleaned_data = {}
         sample_counts = {}
 
         # Step 1: Remove non-standard shapes
         for action in self.actions:
+            if action not in self.data:
+                self.log_and_emit(f"No data found for action: {action}")
+                continue
             cleaned_data[action] = [sample for sample in self.data[action] if sample.shape == (250, 16, 60)]
             sample_counts[action] = len(cleaned_data[action])
             self.log_and_emit(f"{action}: {sample_counts[action]} samples after cleaning")
 
+        if not cleaned_data:
+            self.log_and_emit("No valid data remaining after cleaning.")
+            return
+
         # Step 2: Balance the dataset
         min_samples = min(sample_counts.values())
         for action in self.actions:
+            if action not in cleaned_data:
+                continue
             if len(cleaned_data[action]) > min_samples:
                 # Randomly select min_samples
                 indices = np.random.choice(len(cleaned_data[action]), min_samples, replace=False)
@@ -556,7 +587,7 @@ class EEGAnalysis(QObject):
         self.data = cleaned_data
 
         # Verify the results
-        shapes = {action: [sample.shape for sample in cleaned_data[action]] for action in self.actions}
+        shapes = {action: [sample.shape for sample in cleaned_data[action]] for action in cleaned_data}
         self.log_and_emit("\nFinal data summary:")
         for action, action_shapes in shapes.items():
             shape_counts = Counter(action_shapes)
