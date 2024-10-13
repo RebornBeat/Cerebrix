@@ -69,6 +69,23 @@ class DataProcessingThread(QThread):
         self.eeg_analysis.check_data_consistency()
         self.finished.emit()
 
+class PreprocessingThread(QThread):
+    progress_update = pyqtSignal(int)
+    finished = pyqtSignal()
+
+    def __init__(self, framework, data_dir):
+        super().__init__()
+        self.framework = framework
+        self.data_dir = data_dir
+
+    def run(self):
+        total_actions = len(self.framework.actions)
+        for i, action in enumerate(self.framework.actions):
+            self.framework.preprocess_eeg(self.framework.data[action], action)
+            progress = int((i + 1) / total_actions * 100)
+            self.progress_update.emit(progress)
+        self.finished.emit()
+        
 class EEGAnalysisGUI(QMainWindow):
     def __init__(self):
         super().__init__()
