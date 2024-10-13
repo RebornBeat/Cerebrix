@@ -2,12 +2,12 @@ import os
 import sys
 import time
 import numpy as np
+import json
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QListWidget, QLabel, QFileDialog, QInputDialog,
                              QMessageBox, QProgressBar, QTabWidget, QTextEdit, QSplitter,
-                             QComboBox, QSpinBox, QCheckBox, QGroupBox, QScrollArea, QDialog, QLineEdit, QListWidgetItem)
+                             QComboBox, QSpinBox, QCheckBox, QGroupBox, QScrollArea, QDialog, QLineEdit, QListWidgetItem, QDialogButtonBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtWebEngineWidgets import QWebEngineView
 from pylsl import StreamInlet, resolve_stream
 from EEGAnalysis import EEGAnalysis
 import plotly.graph_objs as go
@@ -19,8 +19,6 @@ from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.animation import FuncAnimation
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from scipy.stats import ttest_ind
-import pandas as pd
 
 class EEGDataCollectionThread(QThread):
     update_progress = pyqtSignal(int)
@@ -438,13 +436,41 @@ class EEGAnalysisGUI(QMainWindow):
         self.clean_data_btn.setEnabled(True)
         self.update_data_lists()
         QMessageBox.information(self, "Success", "Data cleaned, balanced, and consistency checked.")
+        
+    def save_preprocessing_settings(self):
+        settings = {action: self.framework.preprocessing_settings.get(action, {}) 
+                    for action in self.framework.actions}
+        with open('preprocessing_settings.json', 'w') as f:
+            json.dump(settings, f)
+
+    def load_preprocessing_settings(self):
+        try:
+            with open('preprocessing_settings.json', 'r') as f:
+                settings = json.load(f)
+            for action, action_settings in settings.items():
+                self.framework.set_preprocessing_settings(action, action_settings)
+        except FileNotFoundError:
+            pass  # No settings file found, will use defaults
 
     def preprocess_data(self):
         self.preprocess_data_btn.setEnabled(False)
-        self.preprocessing_thread = PreprocessingThread(self.framework, self.data_dir)
-        self.preprocessing_thread.progress_update.connect(self.progress_bar.setValue)
-        self.preprocessing_thread.finished.connect(self.preprocessing_finished)
-        self.preprocessing_thread.start()
+        
+        dialog = MultiActionPreprocessingSettingsDialog(self.framework.actions, self.framework.preprocessing_settings, self)
+        result = dialog.exec_()
+        
+        new_settings = dialog.get_settings()
+        for action, settings in new_settings.items():
+            self.framework.set_preprocessing_settings(action, settings)
+        self.save_preprocessing_settings()
+        
+        if result == QDialog.Accepted:
+            # Proceed with preprocessing
+            self.preprocessing_thread = PreprocessingThread(self.framework, self.data_dir)
+            self.preprocessing_thread.progress_update.connect(self.progress_bar.setValue)
+            self.preprocessing_thread.finished.connect(self.preprocessing_finished)
+            self.preprocessing_thread.start()
+        else:
+            self.preprocess_data_btn.setEnabled(True)
 
     def preprocessing_finished(self):
         self.preprocess_data_btn.setEnabled(True)
@@ -678,39 +704,81 @@ class EEGPlot(QWidget):
         self.canvas.figure.suptitle(f'{data_type} EEG Data - {action.capitalize()} - Sample {sample_index}',
                                     fontsize=16, y=0.98)  # Adjust title position
         self.canvas.draw()
+
+class MultiActionPreprocessingSettingsDialog(QDialog):
+    def __init__(self, actions, current_settings, parent=None):
+        super().__init__(parent)
+        self.actions = actions
+        self.current_settings = current_settings
+        self.new_settings = {}
+        self.setWindowTitle("Preprocessing Settings")
+        self.init_ui()
+
+    def get_default_preprocessing_settings(self):
+        return {
+            'lowcut': 1,
+            'highcut': 60,
+            'notch_freq': 50.0,
+            'quality_factor': 30.0,
+            'adaptive_mu': 0.01,
+            'adaptive_order': 5,
+            'ica_components': 16
+        }
+
+    def init_ui(self):
+        layout = QVBoxLayout()
         
-class PreprocessingThread(QThread):
-    progress_update = pyqtSignal(int)
-    finished = pyqtSignal()
+        self.tab_widget = QTabWidget()
+        for action in self.actions:
+            tab = QWidget()
+            tab_layout = QVBoxLayout(tab)
+            settings = self.current_settings.get(action, self.get_default_preprocessing_settings())
+            
+            for key, value in settings.items():
+                hlayout = QHBoxLayout()
+                hlayout.addWidget(QLabel(f"{key}:"))
+                line_edit = QLineEdit(str(value))
+                line_edit.setObjectName(f"{action}_{key}")
+                hlayout.addWidget(line_edit)
+                tab_layout.addLayout(hlayout)
+            
+            self.tab_widget.addTab(tab, action)
+        
+        layout.addWidget(self.tab_widget)
 
-    def __init__(self, framework, data_dir):
-        super().__init__()
-        self.framework = framework
-        self.data_dir = data_dir
+        button_box = QDialogButtonBox()
+        self.save_button = button_box.addButton("Save", QDialogButtonBox.ActionRole)
+        self.continue_button = button_box.addButton("Save and Continue", QDialogButtonBox.AcceptRole)
+        self.cancel_button = button_box.addButton(QDialogButtonBox.Cancel)
 
-    def run(self):
-        preprocessed_dir = os.path.join(self.data_dir, "preprocessed_data")
-        os.makedirs(preprocessed_dir, exist_ok=True)
+        self.save_button.clicked.connect(self.save_settings)
+        self.continue_button.clicked.connect(self.accept)
+        self.cancel_button.clicked.connect(self.reject)
 
-        total_actions = len(self.framework.actions)
-        for i, action in enumerate(self.framework.actions):
-            self.framework.preprocessed_data[action] = []
-            action_dir = os.path.join(preprocessed_dir, action)
-            os.makedirs(action_dir, exist_ok=True)
+        layout.addWidget(button_box)
+        self.setLayout(layout)
 
-            total_samples = len(self.framework.data[action])
-            for j, sample in enumerate(self.framework.data[action]):
-                preprocessed = self.framework.preprocess_eeg(sample)
-                self.framework.preprocessed_data[action].append(preprocessed)
-                
-                # Save preprocessed data
-                np.save(os.path.join(action_dir, f"sample_{j}.npy"), preprocessed)
-                
-                progress = int((i * total_samples + j + 1) / (total_actions * total_samples) * 100)
-                self.progress_update.emit(progress)
+    def save_settings(self):
+        self.update_settings()
+        QMessageBox.information(self, "Settings Saved", "Preprocessing settings have been saved.")
 
-        self.finished.emit()
+    def update_settings(self):
+        self.new_settings = {}
+        for i, action in enumerate(self.actions):
+            tab = self.tab_widget.widget(i)
+            settings = {}
+            for key in self.get_default_preprocessing_settings().keys():
+                line_edit = tab.findChild(QLineEdit, f"{action}_{key}")
+                if line_edit:
+                    settings[key] = float(line_edit.text())
+            self.new_settings[action] = settings
 
+    def accept(self):
+        self.update_settings()
+        super().accept()
+
+    def get_settings(self):
+        return self.new_settings
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

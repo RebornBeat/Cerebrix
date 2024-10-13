@@ -41,6 +41,7 @@ class EEGAnalysis(QObject):
         self.n_clusters = n_clusters
         self.data = {}
         self.preprocessed_data = {}
+        self.preprocessing_settings = {}
         self.ica_components = {}
         self.cluster_labels = {}
         self.actions = []
@@ -82,7 +83,7 @@ class EEGAnalysis(QObject):
 
     def preprocess_all_data(self):
         for action, batches in self.data.items():
-            self.preprocessed_data[action] = [self.preprocess_eeg(batch) for batch in batches]
+            self.preprocessed_data[action] = [self.preprocess_eeg(batch, action) for batch in batches]
             
     def validate_data(self, data):
         if np.isnan(data).any():
@@ -92,45 +93,53 @@ class EEGAnalysis(QObject):
             self.log_and_emit("Warning: Infinite values detected in the data. Replacing with large finite values.")
             data = np.clip(data, -1e15, 1e15)
         return data
+    
+    def set_preprocessing_settings(self, action, settings):
+        self.preprocessing_settings[action] = settings
 
-    def preprocess_eeg(self, data):
+    def preprocess_eeg(self, data, action):
+        settings = self.preprocessing_settings.get(action, {})
+        
         # Bandpass filtering
+        lowcut = settings.get('lowcut', 1)
+        highcut = settings.get('highcut', 60)
+        filtered_data = self.apply_bandpass_filter(data, lowcut, highcut)
+        
+        # Notch filtering
+        notch_freq = settings.get('notch_freq', 50.0)
+        quality_factor = settings.get('quality_factor', 30.0)
+        notched_data = self.apply_notch_filter(filtered_data, notch_freq, quality_factor)
+        
+        # Adaptive filtering for artifact removal
+        mu = settings.get('adaptive_mu', 0.01)
+        order = settings.get('adaptive_order', 5)
+        adaptive_filtered_data = self.apply_adaptive_filter(notched_data, mu, order)
+        
+        # Artifact removal using FastICA
+        n_components = settings.get('ica_components', data.shape[2])
+        ica_data = self.apply_ica(adaptive_filtered_data, n_components)
+        
+        # Normalization
+        normalized_data = zscore(ica_data, axis=0)
+        
+        return normalized_data
+    
+    def apply_bandpass_filter(self, data, lowcut, highcut):
         nyq = 0.5 * self.fs
-        low = self.lowcut / nyq
-        high = self.highcut / nyq
+        low = lowcut / nyq
+        high = highcut / nyq
         b, a = signal.butter(4, [low, high], btype='band')
         filtered_data = np.zeros_like(data)
         for i in range(data.shape[1]):
             filtered_data[:, i, :] = signal.filtfilt(b, a, data[:, i, :], axis=0)
-        
-        # Notch filtering
-        notch_freq = 50.0
-        quality_factor = 30.0
-        b_notch, a_notch = signal.iirnotch(notch_freq, quality_factor, self.fs)
-        notched_data = np.zeros_like(filtered_data)
-        for i in range(filtered_data.shape[1]):
-            notched_data[:, i, :] = signal.filtfilt(b_notch, a_notch, filtered_data[:, i, :], axis=0)
-        
-        # Adaptive filtering for artifact removal
-        notched_data_clean = self.apply_adaptive_filter(notched_data)
-        
-        notched_data_clean = self.validate_data(notched_data_clean)
-        
-        # Artifact removal using FastICA
-        ica = FastICA(n_components=data.shape[2], random_state=42, max_iter=5000, tol=1e-4)
-        notched_data_clean_ica = np.zeros_like(notched_data_clean)
-        for i in range(notched_data_clean.shape[1]):
-            channel_data = notched_data_clean[:, i, :]
-            try:
-                ica_result = ica.fit_transform(channel_data)
-                notched_data_clean_ica[:, i, :] = ica_result
-            except ValueError as e:
-                self.log_and_emit(f"FastICA failed for channel {i}. Using original data. Error: {e}")
-                notched_data_clean_ica[:, i, :] = channel_data
+        return filtered_data
 
-        # Normalization
-        normalized_data = zscore(notched_data_clean_ica, axis=0)
-        return normalized_data
+    def apply_notch_filter(self, data, notch_freq, quality_factor):
+        b_notch, a_notch = signal.iirnotch(notch_freq, quality_factor, self.fs)
+        notched_data = np.zeros_like(data)
+        for i in range(data.shape[1]):
+            notched_data[:, i, :] = signal.filtfilt(b_notch, a_notch, data[:, i, :], axis=0)
+        return notched_data
 
     def apply_adaptive_filter(self, data, mu=0.01, order=5):
         filtered_data = np.zeros_like(data)
@@ -148,14 +157,14 @@ class EEGAnalysis(QObject):
                     filtered_data[i, channel, time_point] = y if not np.isnan(y) else x[i]
         return filtered_data
 
-    def apply_ica(self):
-        ica = FastICA(n_components=self.n_ica_components, random_state=42)
-        for action, batches in self.preprocessed_data.items():
-            self.ica_components[action] = []
-            for batch in batches:
-                batch_2d = batch.reshape(-1, batch.shape[-1])
-                ica_result = ica.fit_transform(batch_2d)
-                self.ica_components[action].append(ica_result.reshape(batch.shape[0], -1, batch.shape[-1]))
+    def apply_ica(self, data, n_components):
+        ica = FastICA(n_components=n_components, random_state=42, max_iter=5000, tol=1e-4)
+        try:
+            ica_data = ica.fit_transform(data.reshape(-1, data.shape[-1])).reshape(data.shape)
+        except ValueError as e:
+            self.log_and_emit(f"FastICA failed. Using original data. Error: {e}")
+            ica_data = data
+        return ica_data
 
     def cluster_ica_components(self):
         kmeans = KMeans(n_clusters=self.n_clusters, random_state=42)
