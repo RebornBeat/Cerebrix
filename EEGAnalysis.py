@@ -29,22 +29,29 @@ from datetime import datetime
 class EEGAnalysis(QObject):
     progress_update = pyqtSignal(str)
     
-    def __init__(self, data_dir, val_dir, model_dir, fs=250, lowcut=1, highcut=60, n_ica_components=16, n_clusters=5):
+    def __init__(self, base_dir, fs=250, lowcut=1, highcut=60, n_ica_components=16, n_clusters=5):
         super().__init__()
-        self.data_dir = data_dir
-        self.val_dir = val_dir
-        self.model_dir = model_dir
+        self.base_dir = base_dir
+        self.data_dir = os.path.join(base_dir, "model_data")
+        self.logs_dir = os.path.join(base_dir, "logs")
+        self.models_dir = os.path.join(base_dir, "models")
+        self.ensure_directories()
         self.fs = fs
         self.lowcut = lowcut
         self.highcut = highcut
         self.n_ica_components = n_ica_components
         self.n_clusters = n_clusters
-        self.data = {}
+        self.data = {
+            'raw_data': {},
+            'cleaned_data': {},
+            'preprocessed_data': {},
+            'validation_data': {}
+        }
         self.preprocessed_data = {}
         self.preprocessing_settings = {}
         self.ica_components = {}
         self.cluster_labels = {}
-        self.actions = []
+        self.actions = set()
         self.models = {}
         self.frequency_bands = {
             'delta': (1, 4),
@@ -54,32 +61,69 @@ class EEGAnalysis(QObject):
             'gamma': (30, 60)
         }
         
+        self.ensure_directories()
+        
         # Set up logging
-        log_dir = os.path.join(os.path.dirname(data_dir), 'logs')
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f'eeg_analysis_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+        os.makedirs(self.logs_dir, exist_ok=True)
+        log_file = os.path.join(self.logs_dir, f'eeg_analysis_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
         logging.basicConfig(filename=log_file, level=logging.INFO,
                             format='%(asctime)s - %(levelname)s - %(message)s')
         self.logger = logging.getLogger(__name__)
         
+    def ensure_directories(self):
+        for dir_path in [self.data_dir, self.logs_dir, self.models_dir]:
+            os.makedirs(dir_path, exist_ok=True)
+        
+        for subdir in ["raw_data", "cleaned_data", "preprocessed_data", "validation_data"]:
+            os.makedirs(os.path.join(self.data_dir, subdir), exist_ok=True)
+
     def log_and_emit(self, message, level=logging.INFO):
         self.logger.log(level, message)
         self.progress_update.emit(message)
+        
+    def get_data_for_visualization(self, data_type):
+        if data_type not in self.data:
+            self.log_and_emit(f"Invalid data type: {data_type}")
+            return None
+
+        if not self.data[data_type]:
+            self.log_and_emit(f"No data available for {data_type}")
+            return None
+
+        return self.data[data_type]
 
     def load_data(self):
-        for action in os.listdir(self.data_dir):
-            action_dir = os.path.join(self.data_dir, action)
-            if os.path.isdir(action_dir):
-                self.actions.append(action)
-                self.data[action] = []
-                for file in os.listdir(action_dir):
-                    if file.endswith('.npy'):
-                        eeg_data = np.load(os.path.join(action_dir, file))
-                        if eeg_data.shape[1:] == (16, 60):  # Verify the expected shape
-                            self.data[action].append(eeg_data)
-                        else:
-                            self.log_and_emit(f"Skipping file with unexpected shape: {file}")
+        self.data = {key: {} for key in self.data.keys()}
+        self.actions = set()
+
+        for data_type in self.data.keys():
+            data_type_dir = os.path.join(self.data_dir, data_type)
+            if not os.path.exists(data_type_dir):
+                self.log_and_emit(f"Directory not found: {data_type_dir}")
+                continue
+
+            for action in os.listdir(data_type_dir):
+                action_dir = os.path.join(data_type_dir, action)
+                if os.path.isdir(action_dir):
+                    self.actions.add(action)
+                    self.data[data_type][action] = []
+                    for file in os.listdir(action_dir):
+                        if file.endswith('.npy'):
+                            try:
+                                eeg_data = np.load(os.path.join(action_dir, file))
+                                if eeg_data.shape[1:] == (16, 60):
+                                    self.data[data_type][action].append(eeg_data)
+                                else:
+                                    self.log_and_emit(f"Skipping file with unexpected shape: {file}")
+                            except Exception as e:
+                                self.log_and_emit(f"Error loading file {file}: {str(e)}")
+
         self.log_and_emit(f"Loaded actions: {self.actions}")
+        self.log_and_emit(f"Data summary:")
+        for data_type, actions in self.data.items():
+            self.log_and_emit(f"  {data_type}:")
+            for action, data_list in actions.items():
+                self.log_and_emit(f"    {action}: {len(data_list)} samples")
 
     def preprocess_all_data(self):
         for action, batches in self.data.items():

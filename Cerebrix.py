@@ -91,15 +91,11 @@ class EEGAnalysisGUI(QMainWindow):
         super().__init__()
         self.setWindowTitle("EEG Analysis Framework")
         self.setGeometry(100, 100, 1600, 900)
-
-        self.data_dir = os.path.join(os.getcwd(), "model_data")
-        self.ensure_data_directories()
-
-        self.framework = EEGAnalysis(
-            os.path.join(self.data_dir, "raw_data"),
-            os.path.join(self.data_dir, "validation_data"),
-            os.path.join(self.data_dir, "models")
-        )
+        self.base_dir = os.getcwd()
+        self.data_dir = os.path.join(self.base_dir, "model_data")
+        self.logs_dir = os.path.join(self.base_dir, "logs")
+        self.models_dir = os.path.join(self.base_dir, "models")
+        self.framework = EEGAnalysis(self.base_dir)
         self.framework.progress_update.connect(self.update_log)
 
         self.data_lists = {}
@@ -160,10 +156,9 @@ class EEGAnalysisGUI(QMainWindow):
 
         # Tabs for different data stages
         self.tabs = QTabWidget()
-        self.tabs.addTab(self.create_data_tab("raw_data"), "Raw Data")
-        self.tabs.addTab(self.create_data_tab("cleaned_data"), "Cleaned Data")
-        self.tabs.addTab(self.create_data_tab("preprocessed_data"), "Preprocessed Data")
-        self.tabs.addTab(self.create_data_tab("validation_data"), "Validation Data")
+        self.tabs.clear()
+        for data_type in ["raw_data", "cleaned_data", "preprocessed_data", "validation_data"]:
+            self.tabs.addTab(self.create_data_tab(data_type), data_type.replace('_', ' ').title())
         self.tabs.currentChanged.connect(self.on_tab_changed)
         left_layout.addWidget(self.tabs)
 
@@ -274,17 +269,30 @@ class EEGAnalysisGUI(QMainWindow):
         return tab
 
     def update_data_lists(self):
-        for data_type in ["raw_data", "cleaned_data", "preprocessed_data", "validation_data"]:
-            self.data_lists[data_type].clear()
-            data_dir = os.path.join(self.data_dir, data_type)
-            if os.path.exists(data_dir):
-                for action in os.listdir(data_dir):
-                    self.data_lists[data_type].addItem(action)
+        for data_type in self.framework.data.keys():
+            list_widget = self.data_lists[data_type]
+            list_widget.clear()
+            for action in self.framework.data[data_type].keys():
+                list_widget.addItem(action)
 
     def on_tab_changed(self, index):
+        self.cleanup_animation()
         tab_name = self.tabs.tabText(index)
         self.visualize_data_for_tab(tab_name)
+        self.update_visualization()  
 
+    def cleanup_animation(self):
+        if hasattr(self, 'anim') and self.anim is not None:
+            self.anim.event_source.stop()
+            self.anim._stop()
+            del self.anim
+        if hasattr(self, 'ax_3d'):
+            self.ax_3d = None
+        if hasattr(self, 'fig_3d'):
+            self.fig_3d.clf()
+        if hasattr(self, 'canvas_3d'):
+            self.canvas_3d.draw()
+    
     def load_and_visualize_data(self):
         print("Loading and visualizing data...")
         self.framework.load_data()
@@ -295,66 +303,65 @@ class EEGAnalysisGUI(QMainWindow):
 
         # Populate action combo box
         self.action_combo.clear()
-        self.action_combo.addItems(self.framework.actions)
+        self.action_combo.addItems(sorted(self.framework.actions))
 
         # Set sample spinner range
-        if self.framework.actions:
-            max_samples = max(len(self.framework.data[action]) for action in self.framework.actions)
-            self.sample_spinner.setRange(0, max_samples - 1)
+        max_samples = 0
+        for data_type in self.framework.data.keys():
+            for action in self.framework.data[data_type].keys():
+                max_samples = max(max_samples, len(self.framework.data[data_type][action]))
 
-        # Check if preprocessed data is available
-        preprocessed_data_dir = os.path.join(self.data_dir, "preprocessed_data")
-        if os.path.exists(preprocessed_data_dir) and os.listdir(preprocessed_data_dir):
+        if max_samples > 0:
+            self.sample_spinner.setRange(0, max_samples - 1)
+        else:
+            self.sample_spinner.setRange(0, 0)
+            self.update_log("No samples found in the dataset.")
+            return
+
+        # Determine which tab to display based on available data
+        if self.framework.data['preprocessed_data']:
             self.tabs.setCurrentIndex(2)  # Switch to "Preprocessed Data" tab
             self.visualize_data_for_tab("Preprocessed Data")
-        elif os.path.exists(os.path.join(self.data_dir, "cleaned_data")) and os.listdir(os.path.join(self.data_dir, "cleaned_data")):
+        elif self.framework.data['cleaned_data']:
             self.tabs.setCurrentIndex(1)  # Switch to "Cleaned Data" tab
             self.visualize_data_for_tab("Cleaned Data")
-        else:
+        elif self.framework.data['raw_data']:
+            self.tabs.setCurrentIndex(0)  # Switch to "Raw Data" tab
             self.visualize_data_for_tab("Raw Data")
+        else:
+            self.update_log("No data available for visualization in any category.")
 
-    def visualize_data_for_tab(self, tab_name):
-        if tab_name == "Raw Data":
-            self.visualize_data(self.framework.data, "Raw")
-        elif tab_name == "Cleaned Data":
-            cleaned_data_dir = os.path.join(self.data_dir, "cleaned_data")
-            if os.path.exists(cleaned_data_dir) and os.listdir(cleaned_data_dir):
-                self.visualize_data(self.framework.data, "Cleaned")
-            else:
-                self.update_log("No cleaned data available. Showing raw data.")
-                self.visualize_data(self.framework.data, "Raw")
-        elif tab_name == "Preprocessed Data":
-            preprocessed_data_dir = os.path.join(self.data_dir, "preprocessed_data")
-            if os.path.exists(preprocessed_data_dir) and os.listdir(preprocessed_data_dir):
-                self.visualize_data(self.framework.preprocessed_data, "Preprocessed")
-            else:
-                self.update_log("No preprocessed data available. Showing cleaned or raw data.")
-                self.visualize_data_for_tab("Cleaned Data")
-        elif tab_name == "Validation Data":
-            validation_data_dir = os.path.join(self.data_dir, "validation_data")
-            if os.path.exists(validation_data_dir) and os.listdir(validation_data_dir):
-                self.visualize_data(self.framework.data, "Validation")  # Assuming validation data is stored in self.framework.data
-            else:
-                self.update_log("No validation data available.")
-                self.clear_visualizations()
+        self.update_data_lists()
+        self.update_visualization()
 
-    def visualize_data(self, data, data_type):
-        if not data or not self.framework.actions:
-            self.update_log(f"No {data_type.lower()} data available for visualization.")
+    def visualize_data_for_tab(self, data_type):
+        # Convert data_type to the format used in self.data dictionary
+        data_type_key = data_type.lower().replace(' ', '_')
+        
+        data = self.framework.get_data_for_visualization(data_type_key)
+        if data is None:
+            self.clear_visualizations()
             return
 
         action = self.action_combo.currentText()
-        sample_index = self.sample_spinner.value()
+        if not action or action not in data:
+            self.clear_visualizations()
+            return
 
+        sample_index = min(self.sample_spinner.value(), len(data[action]) - 1)
         self.plot_2d.plot_eeg(data, action, sample_index, data_type, 
                               self.selected_channels, self.selected_frequencies)
-        
         self.update_3d_animation(data, action, sample_index, data_type)
+        self.update_explanations(data[action][sample_index], action)
         
+    def update_explanations(self, sample, action):
         # Update 2D explanation
-        sample = data[action][sample_index]
-        explanation = self.generate_2d_explanation(sample, action)
-        self.explanation_2d.setText(explanation)
+        explanation_2d = self.generate_2d_explanation(sample, action)
+        self.explanation_2d.setText(explanation_2d)
+
+        # Update 3D explanation
+        explanation_3d = self.generate_3d_explanation(sample, action)
+        self.explanation_3d.setText(explanation_3d)
         
     def open_frequency_selection(self):
         dialog = FrequencySelectionDialog(self.selected_frequencies)
@@ -369,6 +376,7 @@ class EEGAnalysisGUI(QMainWindow):
 
         sample = data[action][sample_index]
 
+        self.cleanup_animation()  # Ensure any existing animation is cleaned up
         self.fig_3d.clear()
         self.ax_3d = self.fig_3d.add_subplot(111, projection='3d')
 
@@ -417,19 +425,20 @@ class EEGAnalysisGUI(QMainWindow):
         explanation = self.generate_3d_explanation(sample, action)
         self.explanation_3d.setText(explanation)
 
+    def update_action_combo(self):
+        self.action_combo.clear()
+        self.action_combo.addItems(sorted(self.framework.actions))
+
     def update_visualization(self):
         current_tab = self.tabs.currentWidget()
-        tab_name = self.tabs.tabText(self.tabs.currentIndex())
-        self.visualize_data_for_tab(tab_name)
+        if current_tab:
+            data_type = self.tabs.tabText(self.tabs.currentIndex())
+            self.visualize_data_for_tab(data_type)
 
     def clear_visualizations(self):
-        if hasattr(self, 'anim'):
-            self.anim.event_source.stop()
+        self.cleanup_animation()
         self.plot_2d.canvas.figure.clear()
         self.plot_2d.canvas.draw()
-        self.fig_3d.clear()
-        self.ax_3d = None
-        self.canvas_3d.draw()
         self.explanation_2d.clear()
         self.explanation_3d.clear()
 
@@ -604,16 +613,32 @@ class EEGAnalysisGUI(QMainWindow):
         action = self.action_combo.currentText()
         sample_index = self.sample_spinner.value()
 
-        from_sample = getattr(self.framework, f"{from_data}")[action][sample_index]
-        to_sample = getattr(self.framework, f"{to_data}")[action][sample_index]
+        # Check if the data types exist
+        if from_data not in self.framework.data or to_data not in self.framework.data:
+            QMessageBox.warning(self, "Data Not Available", f"One or both of the selected data types ({from_data}, {to_data}) are not available.")
+            return
+
+        # Check if the action exists in both data types
+        if action not in self.framework.data[from_data] or action not in self.framework.data[to_data]:
+            QMessageBox.warning(self, "Action Not Available", f"The selected action '{action}' is not available in one or both of the selected data types.")
+            return
+
+        # Check if the sample index is valid
+        if sample_index >= len(self.framework.data[from_data][action]) or sample_index >= len(self.framework.data[to_data][action]):
+            QMessageBox.warning(self, "Invalid Sample Index", f"The selected sample index {sample_index} is out of range for one or both of the selected data types.")
+            return
+
+        # Access the data
+        from_sample = self.framework.data[from_data][action][sample_index]
+        to_sample = self.framework.data[to_data][action][sample_index]
 
         fig, axs = plt.subplots(4, 4, figsize=(15, 15))
         fig.suptitle(f'Comparison: {from_data.capitalize()} vs {to_data.capitalize()} - {action} - Sample {sample_index}')
 
         for i, ax in enumerate(axs.flat):
             if i < 16:  # We have 16 channels
-                ax.plot(from_sample[0, i, :], label=from_data.capitalize(), alpha=0.7)
-                ax.plot(to_sample[0, i, :], label=to_data.capitalize(), alpha=0.7)
+                ax.plot(from_sample[:, i], label=from_data.capitalize(), alpha=0.7)
+                ax.plot(to_sample[:, i], label=to_data.capitalize(), alpha=0.7)
                 ax.set_title(f'Channel {i+1}')
                 ax.set_ylim(min(np.min(from_sample), np.min(to_sample)), max(np.max(from_sample), np.max(to_sample)))
                 if i == 0:  # Only show legend for the first subplot
