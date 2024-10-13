@@ -72,6 +72,7 @@ class DataProcessingThread(QThread):
 class PreprocessingThread(QThread):
     progress_update = pyqtSignal(int)
     finished = pyqtSignal()
+    error = pyqtSignal(str)
 
     def __init__(self, framework, data_dir):
         super().__init__()
@@ -79,11 +80,30 @@ class PreprocessingThread(QThread):
         self.data_dir = data_dir
 
     def run(self):
+        if 'cleaned_data' not in self.framework.data or not self.framework.data['cleaned_data']:
+            self.error.emit("No cleaned data available. Please clean the data before preprocessing.")
+            self.finished.emit()
+            return
+
         total_actions = len(self.framework.actions)
-        for i, action in enumerate(self.framework.actions):
-            self.framework.preprocess_eeg(self.framework.data[action], action)
-            progress = int((i + 1) / total_actions * 100)
-            self.progress_update.emit(progress)
+        processed_actions = 0
+        for action in self.framework.actions:
+            if action in self.framework.data['cleaned_data']:
+                try:
+                    data = self.framework.data['cleaned_data'][action]
+                    self.framework.preprocess_eeg(data, action)
+                    processed_actions += 1
+                    progress = int((processed_actions / total_actions) * 100)
+                    self.progress_update.emit(progress)
+                except Exception as e:
+                    self.error.emit(f"Error preprocessing action '{action}': {str(e)}")
+            else:
+                self.error.emit(f"No cleaned data found for action '{action}'. Skipping.")
+        
+        if processed_actions == 0:
+            self.error.emit("No actions could be preprocessed. Please check your cleaned data.")
+        else:
+            self.framework.data['preprocessed_data'] = self.framework.preprocessed_data
         self.finished.emit()
         
 class EEGAnalysisGUI(QMainWindow):
@@ -487,26 +507,31 @@ class EEGAnalysisGUI(QMainWindow):
         except FileNotFoundError:
             pass  # No settings file found, will use defaults
 
+
     def preprocess_data(self):
+        if not self.framework.data.get('cleaned_data'):
+            QMessageBox.warning(self, "No Cleaned Data", "No cleaned data available. Please clean the data first.")
+            return
+
         self.preprocess_data_btn.setEnabled(False)
         
         dialog = MultiActionPreprocessingSettingsDialog(self.framework.actions, self.framework.preprocessing_settings, self)
         result = dialog.exec_()
         
-        new_settings = dialog.get_settings()
-        for action, settings in new_settings.items():
-            self.framework.set_preprocessing_settings(action, settings)
-        self.save_preprocessing_settings()
-        
         if result == QDialog.Accepted:
+            new_settings = dialog.get_settings()
+            for action, settings in new_settings.items():
+                self.framework.set_preprocessing_settings(action, settings)
+            self.save_preprocessing_settings()
+            
             # Proceed with preprocessing
             self.preprocessing_thread = PreprocessingThread(self.framework, self.data_dir)
             self.preprocessing_thread.progress_update.connect(self.progress_bar.setValue)
             self.preprocessing_thread.finished.connect(self.preprocessing_finished)
+            self.preprocessing_thread.error.connect(self.preprocessing_error)
             self.preprocessing_thread.start()
         else:
             self.preprocess_data_btn.setEnabled(True)
-
     def preprocessing_finished(self):
         self.preprocess_data_btn.setEnabled(True)
         self.progress_bar.setValue(0)
