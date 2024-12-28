@@ -3,23 +3,24 @@ import sys
 import time
 import numpy as np
 import json
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QRunnable, QObject, QThreadPool, QStringListModel, QEvent
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QListWidget, QLabel, QFileDialog, QInputDialog,
                              QMessageBox, QProgressBar, QTabWidget, QTextEdit, QSplitter,
-                             QComboBox, QSpinBox, QCheckBox, QGroupBox, QScrollArea, QDialog, QLineEdit, QListWidgetItem, QDialogButtonBox)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+                             QComboBox, QSpinBox, QCheckBox, QGroupBox, QScrollArea, QDialog,
+                             QLineEdit, QListWidgetItem, QDialogButtonBox, QListView, QCompleter)
+from PyQt5.QtGui import QStandardItemModel, QStandardItem
 from pylsl import StreamInlet, resolve_stream
 from EEGAnalysis import EEGAnalysis
 import plotly.graph_objs as go
-from plotly.subplots import make_subplots
-import plotly.io as pio
-from plotly.offline import plot
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.animation import FuncAnimation
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-
+from data_manager import DataManager
+from concurrent.futures import ThreadPoolExecutor
+    
 class EEGDataCollectionThread(QThread):
     update_progress = pyqtSignal(int)
     finished = pyqtSignal()
@@ -55,57 +56,150 @@ class EEGDataCollectionThread(QThread):
         filename = os.path.join(action_dir, f"{int(time.time())}.npy")
         np.save(filename, np.array(channel_datas))
         self.finished.emit()
-
-class DataProcessingThread(QThread):
-    finished = pyqtSignal()
-
-    def __init__(self, eeg_analysis):
-        super().__init__()
-        self.eeg_analysis = eeg_analysis
+        
+class Worker(QRunnable):
+    def __init__(self, fn, *args, **kwargs):
+        super(Worker, self).__init__()
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
 
     def run(self):
-        self.eeg_analysis.check_data_consistency()
-        self.eeg_analysis.clean_and_balance_data()
-        self.eeg_analysis.check_data_consistency()
-        self.finished.emit()
+        try:
+            result = self.fn(*self.args, **self.kwargs)
+            if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
+                self.signals.progress.emit(result[0])
+                result = result[1]
+            self.signals.result.emit(result)
+        except Exception as e:
+            self.signals.error.emit(str(e))
+        finally:
+            self.signals.finished.emit()
 
-class PreprocessingThread(QThread):
-    progress_update = pyqtSignal(int)
+class WorkerSignals(QObject):
     finished = pyqtSignal()
     error = pyqtSignal(str)
+    result = pyqtSignal(object)
+    progress = pyqtSignal(str)
+    
+from PyQt5.QtCore import Qt, QTimer, QEvent
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLineEdit, QListView
+from PyQt5.QtGui import QStandardItemModel, QStandardItem
 
-    def __init__(self, framework, data_dir):
-        super().__init__()
-        self.framework = framework
-        self.data_dir = data_dir
+class SearchWidget(QWidget):
+    def __init__(self, main_gui, parent=None):
+        super().__init__(parent)
+        self.main_gui = main_gui
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.search_field = QLineEdit(self)
+        self.search_field.setPlaceholderText("Search for sample file")
+        self.layout.addWidget(self.search_field)
 
-    def run(self):
-        if 'cleaned_data' not in self.framework.data or not self.framework.data['cleaned_data']:
-            self.error.emit("No cleaned data available. Please clean the data before preprocessing.")
-            self.finished.emit()
-            return
+        self.dropdown = QListView(self)
+        self.dropdown.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
+        self.dropdown.setEditTriggers(QListView.NoEditTriggers)
+        self.dropdown.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.dropdown.setMouseTracking(True)
+        self.dropdown.clicked.connect(self.on_item_clicked)
+        self.dropdown.entered.connect(self.on_item_entered)
 
-        total_actions = len(self.framework.actions)
-        processed_actions = 0
-        for action in self.framework.actions:
-            if action in self.framework.data['cleaned_data']:
-                try:
-                    data = self.framework.data['cleaned_data'][action]
-                    self.framework.preprocess_eeg(data, action)
-                    processed_actions += 1
-                    progress = int((processed_actions / total_actions) * 100)
-                    self.progress_update.emit(progress)
-                except Exception as e:
-                    self.error.emit(f"Error preprocessing action '{action}': {str(e)}")
+        self.model = QStandardItemModel()
+        self.dropdown.setModel(self.model)
+
+        self.search_field.textChanged.connect(self.on_text_changed)
+        self.search_field.installEventFilter(self)
+        self.dropdown.installEventFilter(self)
+
+        self.update_timer = QTimer(self)
+        self.update_timer.setSingleShot(True)
+        self.update_timer.timeout.connect(self.update_dropdown)
+
+    def on_text_changed(self):
+        # Reset and start the timer
+        self.update_timer.stop()
+        self.update_timer.start(600)  # 200ms delay
+
+    def update_dropdown(self):
+        text = self.search_field.text()
+        self.model.clear()
+        if text:
+            for item in self.main_gui.get_filtered_samples(text):
+                self.model.appendRow(QStandardItem(item))
+            
+            if self.model.rowCount() > 0:
+                self.show_dropdown()
             else:
-                self.error.emit(f"No cleaned data found for action '{action}'. Skipping.")
-        
-        if processed_actions == 0:
-            self.error.emit("No actions could be preprocessed. Please check your cleaned data.")
+                self.hide_dropdown()
         else:
-            self.framework.data['preprocessed_data'] = self.framework.preprocessed_data
-        self.finished.emit()
+            self.hide_dropdown()
+
+    def show_dropdown(self):
+        width = self.search_field.width()
+        height = min(200, self.model.rowCount() * 20)
+        x = self.search_field.mapToGlobal(self.search_field.rect().bottomLeft()).x()
+        y = self.search_field.mapToGlobal(self.search_field.rect().bottomLeft()).y()
         
+        self.dropdown.setGeometry(x, y, width, height)
+        self.dropdown.show()
+
+        # Highlight the first item
+        if self.model.rowCount() > 0:
+            first_item = self.model.item(0)
+            self.dropdown.setCurrentIndex(first_item.index())
+
+    def hide_dropdown(self):
+        self.dropdown.hide()
+
+    def on_item_clicked(self, index):
+        item = self.model.itemFromIndex(index)
+        if item:
+            self.search_field.setText(item.text())
+            self.hide_dropdown()
+            self.main_gui.select_sample_from_search(item.text())
+
+    def on_item_entered(self, index):
+        self.dropdown.setCurrentIndex(index)
+
+    def eventFilter(self, obj, event):
+        if obj == self.search_field:
+            if event.type() == QEvent.KeyPress:
+                if self.dropdown.isVisible():
+                    current_index = self.dropdown.currentIndex()
+                    if event.key() == Qt.Key_Down:
+                        next_index = self.model.index(current_index.row() + 1, 0)
+                        if next_index.isValid():
+                            self.dropdown.setCurrentIndex(next_index)
+                        return True
+                    elif event.key() == Qt.Key_Up:
+                        prev_index = self.model.index(current_index.row() - 1, 0)
+                        if prev_index.isValid():
+                            self.dropdown.setCurrentIndex(prev_index)
+                        return True
+                    elif event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
+                        self.on_item_clicked(current_index)
+                        return True
+                    elif event.key() == Qt.Key_Escape:
+                        self.hide_dropdown()
+                        return True
+        elif obj == self.dropdown:
+            if event.type() == QEvent.MouseButtonPress:
+                if not self.dropdown.rect().contains(event.pos()):
+                    self.hide_dropdown()
+                    return True
+        return super().eventFilter(obj, event)
+
+    def focusOutEvent(self, event):
+        # Use a timer to delay hiding the dropdown
+        QTimer.singleShot(100, self.check_focus_and_hide_dropdown)
+        super().focusOutEvent(event)
+
+    def check_focus_and_hide_dropdown(self):
+        # Only hide the dropdown if neither the search field nor the dropdown has focus
+        if not self.search_field.hasFocus() and not self.dropdown.hasFocus():
+            self.hide_dropdown()
+
 class EEGAnalysisGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -116,16 +210,14 @@ class EEGAnalysisGUI(QMainWindow):
         self.logs_dir = os.path.join(self.base_dir, "logs")
         self.models_dir = os.path.join(self.base_dir, "models")
         self.framework = EEGAnalysis(self.base_dir)
-        self.framework.progress_update.connect(self.update_log)
-
-        self.data_lists = {}
+        self.data_lists = {}  # Initialize data_lists here
         self.selected_channels = list(range(16))  # All channels selected by default
         self.selected_frequencies = list(range(1, 61))  # All frequencies selected by default
+        self.threadpool = QThreadPool()
         self.init_ui()
-        self.update_data_lists()
-        self.load_recent_logs()
-        self.load_and_visualize_data()
-        self.update_visualization()
+        self.progress_timer = QTimer()
+        self.progress_timer.timeout.connect(self.update_progress_from_queue)
+        self.progress_timer.start(10)  
 
     def init_ui(self):
         central_widget = QWidget()
@@ -140,15 +232,35 @@ class EEGAnalysisGUI(QMainWindow):
         control_group = QGroupBox("Data Selection")
         control_layout = QVBoxLayout()
 
+        # Action selection
+        action_layout = QHBoxLayout()
+        action_layout.addWidget(QLabel("Action:"))
         self.action_combo = QComboBox()
         self.action_combo.currentTextChanged.connect(self.update_visualization)
-        control_layout.addWidget(QLabel("Action:"))
-        control_layout.addWidget(self.action_combo)
+        action_layout.addWidget(self.action_combo)
+        control_layout.addLayout(action_layout)
 
+        # File name display
+        self.file_name_label = QLabel()
+        control_layout.addWidget(self.file_name_label)
+
+        # Sample selection
+        sample_layout = QHBoxLayout()
+        sample_layout.addWidget(QLabel("Sample:"))
         self.sample_spinner = QSpinBox()
         self.sample_spinner.valueChanged.connect(self.update_visualization)
-        control_layout.addWidget(QLabel("Sample:"))
-        control_layout.addWidget(self.sample_spinner)
+        sample_layout.addWidget(self.sample_spinner)
+        control_layout.addLayout(sample_layout)
+
+        # New SearchWidget
+        self.search_widget = SearchWidget(self, parent=control_group)
+        control_layout.addWidget(self.search_widget)
+        self.search_widget.search_field.installEventFilter(self.search_widget)
+
+        # Frequency selection
+        self.freq_select_btn = QPushButton("Select Frequencies")
+        self.freq_select_btn.clicked.connect(self.open_frequency_selection)
+        control_layout.addWidget(self.freq_select_btn)
 
         control_group.setLayout(control_layout)
         left_layout.addWidget(control_group)
@@ -168,16 +280,11 @@ class EEGAnalysisGUI(QMainWindow):
         channel_scroll.setWidget(channel_group)
         channel_scroll.setWidgetResizable(True)
         left_layout.addWidget(channel_scroll)
-        
-        # Add frequency selection button
-        self.freq_select_btn = QPushButton("Select Frequencies")
-        self.freq_select_btn.clicked.connect(self.open_frequency_selection)
-        control_layout.addWidget(self.freq_select_btn)
 
         # Tabs for different data stages
         self.tabs = QTabWidget()
         self.tabs.clear()
-        for data_type in ["raw_data", "cleaned_data", "preprocessed_data", "validation_data"]:
+        for data_type in ["raw_data", "cleaned_data", "validation_data"]:
             self.tabs.addTab(self.create_data_tab(data_type), data_type.replace('_', ' ').title())
         self.tabs.currentChanged.connect(self.on_tab_changed)
         left_layout.addWidget(self.tabs)
@@ -192,32 +299,11 @@ class EEGAnalysisGUI(QMainWindow):
         self.clean_data_btn.clicked.connect(self.clean_and_balance_data)
         button_layout.addWidget(self.clean_data_btn)
 
-        self.preprocess_data_btn = QPushButton("Preprocess Data")
-        self.preprocess_data_btn.clicked.connect(self.preprocess_data)
-        button_layout.addWidget(self.preprocess_data_btn)
-
-        self.analyze_btn = QPushButton("Run Analysis")
-        self.analyze_btn.clicked.connect(self.run_analysis)
-        button_layout.addWidget(self.analyze_btn)
+        self.train_data_btn = QPushButton("Train Data")
+        self.train_data_btn.clicked.connect(self.train_data)
+        button_layout.addWidget(self.train_data_btn)
 
         left_layout.addLayout(button_layout)
-
-        # Add Compare Data button
-        self.compare_data_btn = QPushButton("Compare Data")
-        self.compare_data_btn.clicked.connect(self.compare_data)
-        left_layout.addWidget(self.compare_data_btn)
-
-        # Add combo boxes for data comparison
-        self.comparison_layout = QHBoxLayout()
-        self.comparison_layout.addWidget(QLabel("Compare:"))
-        self.compare_from_combo = QComboBox()
-        self.compare_from_combo.addItems(["Raw Data", "Cleaned Data", "Preprocessed Data"])
-        self.comparison_layout.addWidget(self.compare_from_combo)
-        self.comparison_layout.addWidget(QLabel("with:"))
-        self.compare_to_combo = QComboBox()
-        self.compare_to_combo.addItems(["Raw Data", "Cleaned Data", "Preprocessed Data"])
-        self.comparison_layout.addWidget(self.compare_to_combo)
-        left_layout.addLayout(self.comparison_layout)
 
         # Progress bar
         self.progress_bar = QProgressBar()
@@ -275,10 +361,69 @@ class EEGAnalysisGUI(QMainWindow):
         splitter.setSizes([400, 1200])
 
         main_layout.addWidget(splitter)
+        self.load_recent_logs()
+        self.load_data_async()
+
+    def update_progress_from_queue(self):
+        while not self.framework.progress_queue.empty():
+            progress, message = self.framework.progress_queue.get()
+            self.progress_bar.setValue(progress)
+            if message:
+                self.update_log(message)
+        QApplication.processEvents()  # Force GUI update
+
+        
+    def load_data_async(self):
+        self.update_log("Loading data...")
+        worker = Worker(self.framework.load_data, progress_callback=self.update_progress)
+        worker.signals.result.connect(self.on_data_loaded)
+        worker.signals.error.connect(self.on_worker_error)
+        self.threadpool.start(worker)
+        
+    def on_data_loaded(self):
+        self.update_action_combo()
+        self.update_sample_spinner()
+        self.update_data_lists()
+        self.load_and_visualize_data()
 
     def update_channel_selection(self):
         self.selected_channels = [i for i in range(16) if self.channel_checkboxes[i].isChecked()]
         self.update_visualization()
+        
+    def get_filtered_samples(self, text):
+        current_tab = self.tabs.currentWidget()
+        if current_tab:
+            data_type = self.tabs.tabText(self.tabs.currentIndex()).lower().replace(' ', '_')
+            action = self.action_combo.currentText()
+            samples = self.framework.data_manager.data_catalog[data_type][action]
+            return [os.path.basename(s) for s in samples if text.lower() in os.path.basename(s).lower()]
+        return []
+
+    def select_sample_from_search(self, sample_name):
+        current_tab = self.tabs.currentWidget()
+        if current_tab:
+            data_type = self.tabs.tabText(self.tabs.currentIndex()).lower().replace(' ', '_')
+            action = self.action_combo.currentText()
+            samples = self.framework.data_manager.data_catalog[data_type][action]
+            for i, sample_path in enumerate(samples):
+                if os.path.basename(sample_path) == sample_name:
+                    self.sample_spinner.setValue(i)
+                    break
+        self.update_visualization()
+
+    def update_file_name_display(self):
+        current_tab = self.tabs.currentWidget()
+        if current_tab:
+            data_type = self.tabs.tabText(self.tabs.currentIndex()).lower().replace(' ', '_')
+            action = self.action_combo.currentText()
+            sample_index = self.sample_spinner.value()
+            if action in self.framework.data_manager.data_catalog[data_type]:
+                if sample_index < len(self.framework.data_manager.data_catalog[data_type][action]):
+                    file_path = self.framework.data_manager.data_catalog[data_type][action][sample_index]
+                    file_name = os.path.basename(file_path)
+                    self.file_name_label.setText(f"File: {file_name}")
+                    return
+        self.file_name_label.setText("File: N/A")
 
     def create_data_tab(self, data_type):
         tab = QWidget()
@@ -289,17 +434,26 @@ class EEGAnalysisGUI(QMainWindow):
         return tab
 
     def update_data_lists(self):
-        for data_type in self.framework.data.keys():
+        for data_type in ['raw_data', 'cleaned_data', 'validation_data']:
             list_widget = self.data_lists[data_type]
             list_widget.clear()
-            for action in self.framework.data[data_type].keys():
+            for action in self.framework.data_manager.get_actions(data_type):
                 list_widget.addItem(action)
-
+                
     def on_tab_changed(self, index):
         self.cleanup_animation()
         tab_name = self.tabs.tabText(index)
-        self.visualize_data_for_tab(tab_name)
-        self.update_visualization()  
+        self.update_visualization()
+        self.search_widget.search_field.clear()
+        self.search_widget.hide_dropdown()
+        
+    def update_sample_spinner(self):
+        current_tab = self.tabs.currentWidget()
+        if current_tab:
+            data_type = self.tabs.tabText(self.tabs.currentIndex()).lower().replace(' ', '_')
+            action = self.action_combo.currentText()
+            sample_count = self.framework.data_manager.get_sample_count(data_type, action)
+            self.sample_spinner.setRange(0, max(0, sample_count - 1))
 
     def cleanup_animation(self):
         if hasattr(self, 'anim') and self.anim is not None:
@@ -314,22 +468,17 @@ class EEGAnalysisGUI(QMainWindow):
             self.canvas_3d.draw()
     
     def load_and_visualize_data(self):
-        print("Loading and visualizing data...")
-        self.framework.load_data()
-
-        if not self.framework.data:
+        self.update_log("Loading and visualizing data...")
+        if not self.framework.actions:
             self.update_log("No data available for visualization.")
             return
 
-        # Populate action combo box
         self.action_combo.clear()
         self.action_combo.addItems(sorted(self.framework.actions))
 
-        # Set sample spinner range
-        max_samples = 0
-        for data_type in self.framework.data.keys():
-            for action in self.framework.data[data_type].keys():
-                max_samples = max(max_samples, len(self.framework.data[data_type][action]))
+        max_samples = max(self.framework.data_manager.get_sample_count(data_type, action)
+                          for data_type in ['raw_data', 'cleaned_data', 'validation_data']
+                          for action in self.framework.data_manager.get_actions(data_type))
 
         if max_samples > 0:
             self.sample_spinner.setRange(0, max_samples - 1)
@@ -338,41 +487,30 @@ class EEGAnalysisGUI(QMainWindow):
             self.update_log("No samples found in the dataset.")
             return
 
-        # Determine which tab to display based on available data
-        if self.framework.data['preprocessed_data']:
-            self.tabs.setCurrentIndex(2)  # Switch to "Preprocessed Data" tab
-            self.visualize_data_for_tab("Preprocessed Data")
-        elif self.framework.data['cleaned_data']:
+        if self.framework.data_manager.get_actions('cleaned_data'):
             self.tabs.setCurrentIndex(1)  # Switch to "Cleaned Data" tab
-            self.visualize_data_for_tab("Cleaned Data")
-        elif self.framework.data['raw_data']:
+        elif self.framework.data_manager.get_actions('raw_data'):
             self.tabs.setCurrentIndex(0)  # Switch to "Raw Data" tab
-            self.visualize_data_for_tab("Raw Data")
         else:
             self.update_log("No data available for visualization in any category.")
 
-        self.update_data_lists()
         self.update_visualization()
 
     def visualize_data_for_tab(self, data_type):
-        # Convert data_type to the format used in self.data dictionary
-        data_type_key = data_type.lower().replace(' ', '_')
-        
-        data = self.framework.get_data_for_visualization(data_type_key)
-        if data is None:
-            self.clear_visualizations()
-            return
-
         action = self.action_combo.currentText()
-        if not action or action not in data:
+        sample_index = self.sample_spinner.value()
+
+        data = self.framework.data_manager.load_data(data_type, action, sample_index)
+        if data is None:
+            self.update_log(f"Failed to load data for {action}, sample {sample_index}")
             self.clear_visualizations()
             return
 
-        sample_index = min(self.sample_spinner.value(), len(data[action]) - 1)
+        self.update_log(f"Visualizing {data_type} for {action}, sample {sample_index}")
         self.plot_2d.plot_eeg(data, action, sample_index, data_type, 
                               self.selected_channels, self.selected_frequencies)
         self.update_3d_animation(data, action, sample_index, data_type)
-        self.update_explanations(data[action][sample_index], action)
+        self.update_explanations(data, action)
         
     def update_explanations(self, sample, action):
         # Update 2D explanation
@@ -390,11 +528,11 @@ class EEGAnalysisGUI(QMainWindow):
             self.update_visualization()
     
     def update_3d_animation(self, data, action, sample_index, data_type):
-        if action not in data or sample_index >= len(data[action]):
-            self.update_log(f"Invalid action or sample index for {data_type} data.")
+        if data is None or data.ndim != 3:
+            self.update_log(f"Invalid data format for 3D animation: {data_type} data.")
             return
 
-        sample = data[action][sample_index]
+        sample = data  # The data is already the correct sample
 
         self.cleanup_animation()  # Ensure any existing animation is cleaned up
         self.fig_3d.clear()
@@ -448,12 +586,18 @@ class EEGAnalysisGUI(QMainWindow):
     def update_action_combo(self):
         self.action_combo.clear()
         self.action_combo.addItems(sorted(self.framework.actions))
+        self.search_widget.search_field.clear()
+        self.search_widget.hide_dropdown()
 
     def update_visualization(self):
         current_tab = self.tabs.currentWidget()
         if current_tab:
-            data_type = self.tabs.tabText(self.tabs.currentIndex())
+            data_type = self.tabs.tabText(self.tabs.currentIndex()).lower().replace(' ', '_')
+            self.update_log(f"Updating visualization for {data_type}")
             self.visualize_data_for_tab(data_type)
+            self.update_file_name_display()
+        else:
+            self.update_log("No tab selected for visualization")
 
     def clear_visualizations(self):
         self.cleanup_animation()
@@ -461,6 +605,10 @@ class EEGAnalysisGUI(QMainWindow):
         self.plot_2d.canvas.draw()
         self.explanation_2d.clear()
         self.explanation_3d.clear()
+        
+    def log_and_emit(self, message):
+        print(message)  # Print to console for debugging
+        self.update_log(message)
 
     def collect_eeg_data(self):
         action, ok = QInputDialog.getText(self, "Collect EEG Data", "Enter action name:")
@@ -476,77 +624,92 @@ class EEGAnalysisGUI(QMainWindow):
         self.progress_bar.setValue(0)
         self.update_data_lists()
         QMessageBox.information(self, "Success", "EEG data collection completed.")
+        
 
     def clean_and_balance_data(self):
-        if not self.framework.data['raw_data']:
-            QMessageBox.warning(self, "No Data", "No raw data available. Please load data first.")
-            return
-
         self.clean_data_btn.setEnabled(False)
-        self.processing_thread = DataProcessingThread(self.framework)
-        self.processing_thread.finished.connect(self.on_processing_finished)
-        self.processing_thread.start()
+        self.progress_bar.setValue(0)
+        self.framework.total_progress = 0
 
-    def on_processing_finished(self):
+        worker = Worker(self.framework.clean_and_balance_data)
+        worker.signals.progress.connect(self.update_log)
+        worker.signals.finished.connect(self.on_data_cleaned)
+        worker.signals.error.connect(self.on_worker_error)
+
+        self.threadpool.start(worker)
+        
+    def on_data_cleaned(self):
         self.clean_data_btn.setEnabled(True)
         self.update_data_lists()
-        QMessageBox.information(self, "Success", "Data cleaned, balanced, and consistency checked.")
+        self.progress_bar.setValue(100)
+        QMessageBox.information(self, "Success", "Data cleaned, balanced, and saved.")
         
-    def save_preprocessing_settings(self):
-        settings = {action: self.framework.preprocessing_settings.get(action, {}) 
-                    for action in self.framework.actions}
-        with open('preprocessing_settings.json', 'w') as f:
-            json.dump(settings, f)
+        # Switch to the "cleaned_data" tab
+        cleaned_data_index = self.tabs.indexOf(self.tabs.findChild(QWidget, "cleaned_data"))
+        if cleaned_data_index != -1:
+            self.tabs.setCurrentIndex(cleaned_data_index)
+    
+    def on_worker_error(self, error):
+        QMessageBox.critical(self, "Error", f"An error occurred: {error}")
+        self.clean_data_btn.setEnabled(True)
+        self.train_data_btn.setEnabled(True)  
+  
+    def update_progress(self, message):
+        if isinstance(message, str):
+            self.update_log(message)
+            if message.endswith('%'):
+                try:
+                    progress = int(message.split()[-1].strip('%'))
+                    self.progress_bar.setValue(progress)
+                except ValueError:
+                    pass
+        elif isinstance(message, int):
+            self.progress_bar.setValue(message)
 
-    def load_preprocessing_settings(self):
-        try:
-            with open('preprocessing_settings.json', 'r') as f:
-                settings = json.load(f)
-            for action, action_settings in settings.items():
-                self.framework.set_preprocessing_settings(action, action_settings)
-        except FileNotFoundError:
-            pass  # No settings file found, will use defaults
-
-
-    def preprocess_data(self):
-        if not self.framework.data.get('cleaned_data'):
+    def train_data(self):
+        if not self.framework.data_manager.get_actions('cleaned_data'):
             QMessageBox.warning(self, "No Cleaned Data", "No cleaned data available. Please clean the data first.")
             return
-
-        self.preprocess_data_btn.setEnabled(False)
         
-        dialog = MultiActionPreprocessingSettingsDialog(self.framework.actions, self.framework.preprocessing_settings, self)
-        result = dialog.exec_()
-        
-        if result == QDialog.Accepted:
-            new_settings = dialog.get_settings()
-            for action, settings in new_settings.items():
-                self.framework.set_preprocessing_settings(action, settings)
-            self.save_preprocessing_settings()
-            
-            # Proceed with preprocessing
-            self.preprocessing_thread = PreprocessingThread(self.framework, self.data_dir)
-            self.preprocessing_thread.progress_update.connect(self.progress_bar.setValue)
-            self.preprocessing_thread.finished.connect(self.preprocessing_finished)
-            self.preprocessing_thread.error.connect(self.preprocessing_error)
-            self.preprocessing_thread.start()
-        else:
-            self.preprocess_data_btn.setEnabled(True)
-    def preprocessing_finished(self):
-        self.preprocess_data_btn.setEnabled(True)
+        self.train_data_btn.setEnabled(False)
         self.progress_bar.setValue(0)
-        self.update_data_lists()
-        self.tabs.setCurrentIndex(self.tabs.indexOf(self.tabs.findChild(QWidget, "preprocessed_data")))
-        QMessageBox.information(self, "Success", "Data preprocessing completed.")
+        self.framework.total_progress = 0
 
-    def run_analysis(self):
-        self.framework.run_analysis()
-        results = self.framework.get_results()
-        QMessageBox.information(self, "Analysis Complete", "EEG analysis completed. Check the logs for detailed results.")
+        worker = Worker(self.framework.run_analysis)
+        worker.signals.progress.connect(self.update_progress)
+        worker.signals.result.connect(self.on_training_complete)
+        worker.signals.error.connect(self.on_worker_error)
+
+        self.threadpool.start(worker)
+
+    def on_training_complete(self, results):
+        self.train_data_btn.setEnabled(True)
+        self.progress_bar.setValue(100)
+        self.update_log("Training complete. Check the logs for detailed results.")
+        self.display_analysis_results(results)
+        QMessageBox.information(self, "Success", "Training has completed.")
+                
+    def display_analysis_results(self, results):
+        result_text = "Analysis Results:\n\n"
+        for model_name, performance in results['model_performances'].items():
+            result_text += f"{model_name.upper()} Model:\n"
+            result_text += f"Accuracy: {performance['accuracy']:.4f}\n"
+            result_text += "Classification Report:\n"
+            result_text += f"{performance['classification_report']}\n\n"
+        
+        self.update_log(result_text)
 
     def update_log(self, message):
         self.log_text.append(message)
         self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+        
+    def update_data_summary(self, summary):
+        summary_text = "Data Summary:\n"
+        for data_type, actions in summary.items():
+            summary_text += f"\n{data_type.capitalize()}:\n"
+            for action, details in actions.items():
+                summary_text += f"  {action}: {details['count']} samples, shape: {details['shape']}\n"
+        self.update_log(summary_text)
 
     def clear_log(self):
         self.log_text.clear()
@@ -570,10 +733,6 @@ class EEGAnalysisGUI(QMainWindow):
                 most_recent_log = os.path.join(log_dir, log_files[0])
                 with open(most_recent_log, 'r') as f:
                     self.log_text.setText(f.read())
-
-    def ensure_data_directories(self):
-        for subdir in ["raw_data", "cleaned_data", "preprocessed_data", "validation_data", "models"]:
-            os.makedirs(os.path.join(self.data_dir, subdir), exist_ok=True)
 
     def generate_2d_explanation(self, sample, action):
         explanation = f"2D EEG Visualization for {action.capitalize()}:\n\n"
@@ -626,59 +785,6 @@ class EEGAnalysisGUI(QMainWindow):
         explanation += "- The lines connecting to the center represent the signal path for each channel.\n"
 
         return explanation
-
-    def compare_data(self):
-        from_data = self.compare_from_combo.currentText().lower().replace(" ", "_")
-        to_data = self.compare_to_combo.currentText().lower().replace(" ", "_")
-        
-        if from_data == to_data:
-            QMessageBox.warning(self, "Invalid Selection", "Please select different data types for comparison.")
-            return
-
-        self.plot_data_comparison(from_data, to_data)
-
-    def plot_data_comparison(self, from_data, to_data):
-        action = self.action_combo.currentText()
-        sample_index = self.sample_spinner.value()
-
-        # Check if the data types exist
-        if from_data not in self.framework.data or to_data not in self.framework.data:
-            QMessageBox.warning(self, "Data Not Available", f"One or both of the selected data types ({from_data}, {to_data}) are not available.")
-            return
-
-        # Check if the action exists in both data types
-        if action not in self.framework.data[from_data] or action not in self.framework.data[to_data]:
-            QMessageBox.warning(self, "Action Not Available", f"The selected action '{action}' is not available in one or both of the selected data types.")
-            return
-
-        # Check if the sample index is valid
-        if sample_index >= len(self.framework.data[from_data][action]) or sample_index >= len(self.framework.data[to_data][action]):
-            QMessageBox.warning(self, "Invalid Sample Index", f"The selected sample index {sample_index} is out of range for one or both of the selected data types.")
-            return
-
-        # Access the data
-        from_sample = self.framework.data[from_data][action][sample_index]
-        to_sample = self.framework.data[to_data][action][sample_index]
-
-        fig, axs = plt.subplots(4, 4, figsize=(15, 15))
-        fig.suptitle(f'Comparison: {from_data.capitalize()} vs {to_data.capitalize()} - {action} - Sample {sample_index}')
-
-        for i, ax in enumerate(axs.flat):
-            if i < 16:  # We have 16 channels
-                ax.plot(from_sample[:, i], label=from_data.capitalize(), alpha=0.7)
-                ax.plot(to_sample[:, i], label=to_data.capitalize(), alpha=0.7)
-                ax.set_title(f'Channel {i+1}')
-                ax.set_ylim(min(np.min(from_sample), np.min(to_sample)), max(np.max(from_sample), np.max(to_sample)))
-                if i == 0:  # Only show legend for the first subplot
-                    ax.legend()
-
-        plt.tight_layout()
-        plt.show()
-
-    def closeEvent(self, event):
-        if hasattr(self, 'anim'):
-            self.anim.event_source.stop()
-        super().closeEvent(event)
         
 class FrequencySelectionDialog(QDialog):
     def __init__(self, current_frequencies):
@@ -747,6 +853,10 @@ class EEGPlot(QWidget):
         self.canvas.figure.clear()
         self.axes = []
 
+        if data is None or data.ndim != 3:
+            print(f"Invalid data format for plotting: {data.shape if data is not None else None}")
+            return
+
         num_channels = len(selected_channels)
         num_cols = 4
         num_rows = (num_channels + num_cols - 1) // num_cols
@@ -768,7 +878,7 @@ class EEGPlot(QWidget):
             row = i // num_cols
             col = i % num_cols
             ax = self.canvas.figure.add_subplot(gs[row, col])
-            channel_data = data[action][sample_index][:, channel, :]
+            channel_data = data[:, channel, :]
             for freq in selected_frequencies:
                 ax.plot(channel_data[:, freq-1], label=f'{freq} Hz')
             ax.set_title(f'Channel {channel + 1}')
@@ -780,81 +890,6 @@ class EEGPlot(QWidget):
         self.canvas.figure.suptitle(f'{data_type} EEG Data - {action.capitalize()} - Sample {sample_index}',
                                     fontsize=16, y=0.98)  # Adjust title position
         self.canvas.draw()
-
-class MultiActionPreprocessingSettingsDialog(QDialog):
-    def __init__(self, actions, current_settings, parent=None):
-        super().__init__(parent)
-        self.actions = actions
-        self.current_settings = current_settings
-        self.new_settings = {}
-        self.setWindowTitle("Preprocessing Settings")
-        self.init_ui()
-
-    def get_default_preprocessing_settings(self):
-        return {
-            'lowcut': 1,
-            'highcut': 60,
-            'notch_freq': 50.0,
-            'quality_factor': 30.0,
-            'adaptive_mu': 0.01,
-            'adaptive_order': 5,
-            'ica_components': 16
-        }
-
-    def init_ui(self):
-        layout = QVBoxLayout()
-        
-        self.tab_widget = QTabWidget()
-        for action in self.actions:
-            tab = QWidget()
-            tab_layout = QVBoxLayout(tab)
-            settings = self.current_settings.get(action, self.get_default_preprocessing_settings())
-            
-            for key, value in settings.items():
-                hlayout = QHBoxLayout()
-                hlayout.addWidget(QLabel(f"{key}:"))
-                line_edit = QLineEdit(str(value))
-                line_edit.setObjectName(f"{action}_{key}")
-                hlayout.addWidget(line_edit)
-                tab_layout.addLayout(hlayout)
-            
-            self.tab_widget.addTab(tab, action)
-        
-        layout.addWidget(self.tab_widget)
-
-        button_box = QDialogButtonBox()
-        self.save_button = button_box.addButton("Save", QDialogButtonBox.ActionRole)
-        self.continue_button = button_box.addButton("Save and Continue", QDialogButtonBox.AcceptRole)
-        self.cancel_button = button_box.addButton(QDialogButtonBox.Cancel)
-
-        self.save_button.clicked.connect(self.save_settings)
-        self.continue_button.clicked.connect(self.accept)
-        self.cancel_button.clicked.connect(self.reject)
-
-        layout.addWidget(button_box)
-        self.setLayout(layout)
-
-    def save_settings(self):
-        self.update_settings()
-        QMessageBox.information(self, "Settings Saved", "Preprocessing settings have been saved.")
-
-    def update_settings(self):
-        self.new_settings = {}
-        for i, action in enumerate(self.actions):
-            tab = self.tab_widget.widget(i)
-            settings = {}
-            for key in self.get_default_preprocessing_settings().keys():
-                line_edit = tab.findChild(QLineEdit, f"{action}_{key}")
-                if line_edit:
-                    settings[key] = float(line_edit.text())
-            self.new_settings[action] = settings
-
-    def accept(self):
-        self.update_settings()
-        super().accept()
-
-    def get_settings(self):
-        return self.new_settings
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
