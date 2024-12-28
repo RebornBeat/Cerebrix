@@ -1,13 +1,18 @@
 import numpy as np
+import pickle
 import os
 import tensorflow as tf
+import json
+import warnings
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense, LayerNormalization, MultiHeadAttention, Dropout, GlobalAveragePooling1D, Conv1D, MaxPooling1D, LSTM, Concatenate
+from tensorflow.keras.layers import Input, Dense, LayerNormalization, MultiHeadAttention, Dropout, GlobalAveragePooling1D, Conv1D, MaxPooling1D, LSTM, Concatenate, TimeDistributed, RepeatVector, Reshape
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 from tensorflow.keras.optimizers import Adam
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score, GridSearchCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from sklearn.exceptions import ConvergenceWarning
 from scipy import signal
 from scipy.stats import zscore
 from scipy.signal import welch
@@ -21,250 +26,480 @@ from sklearn.cluster import KMeans
 from sklearn.manifold import TSNE
 import keras_tuner as kt
 from collections import Counter
-from PyQt5.QtCore import QObject, pyqtSignal
+from multiprocessing import Pool, cpu_count
+from threading import Lock
+import multiprocessing
 import logging
-import os
 from datetime import datetime
+from data_manager import DataManager
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
+import time
+import mlflow
 
-class EEGAnalysis(QObject):
-    progress_update = pyqtSignal(str)
+
+class TemporalSpectralFeatureExtractor(BaseEstimator, TransformerMixin):
+    def __init__(self, fs=25, window_size=5, stride=2, context_size=2, overlap=0.5, max_stack_size=3, feature_version=1):
+        self.fs = fs
+        self.window_size = window_size
+        self.stride = stride
+        self.context_size = context_size
+        self.overlap = overlap
+        self.max_stack_size = max_stack_size
+        self.feature_version = feature_version
+        self.frequency_bands = {
+            'delta': (1, 4), 'theta': (4, 8), 'alpha': (8, 13),
+            'beta': (13, 30), 'gamma': (30, 60)
+        }
+        self.adaptive_window_manager = AdaptiveWindowManager(base_window_size=window_size, 
+                                                             max_stack_size=max_stack_size, 
+                                                             context_size=context_size)
+        
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        features = []
+        for sample in X:
+            sample_features = self.extract_features_windowed(sample)
+            features.append(sample_features)
+        return np.array(features)
+
+
+    def extract_features_windowed(self, sample):
+        self.debug_print(f"Input sample shape: {sample.shape}")
+        windows = self.create_sliding_windows(sample)
+        self.debug_print(f"Number of windows: {len(windows)}")
+        self.debug_print(f"Shape of first window: {windows[0].shape}")
+        features = []
+        for i in range(len(windows)):
+            stack_size = self.adaptive_window_manager.decide_stack_size(windows[i])
+            stacked_window = self.get_stacked_window(windows, i, stack_size)
+            context = self.get_context(windows, i)
+            self.debug_print(f"Context shape: {np.array(context).shape}")
+            window_features = self.extract_features_with_context(context, stacked_window)
+            features.append(window_features)
+        
+        self.debug_print(f"Final features shape: {np.array(features).shape}")
+        return np.array(features)
+
+    def extract_features_with_context(self, context, stacked_window):
+        self.debug_print(f"Stacked window shape: {stacked_window.shape}")
+        features = self.extract_features_from_window(stacked_window)
+        context_features = self.extract_context_features(context)
+        return np.concatenate([features, context_features])
+
+    def create_sliding_windows(self, data):
+        return [data[i:i+self.window_size] for i in range(0, len(data) - self.window_size + 1, self.stride)]
+
+    def extract_features_from_window(self, window):
+        self.debug_print(f"Window shape in extract_features_from_window: {window.shape}")
+        features = []
+        
+        # Spectral power features
+        for band, (low, high) in self.frequency_bands.items():
+            band_power = self.compute_band_power(window, low, high)
+            features.extend([np.mean(band_power), np.std(band_power), np.max(band_power), np.min(band_power),
+                             np.median(band_power), np.ptp(band_power), np.mean(np.diff(band_power))])
+
+        # Compute ratios
+        delta = self.compute_band_power(window, *self.frequency_bands['delta'])
+        theta = self.compute_band_power(window, *self.frequency_bands['theta'])
+        alpha = self.compute_band_power(window, *self.frequency_bands['alpha'])
+        beta = self.compute_band_power(window, *self.frequency_bands['beta'])
+        gamma = self.compute_band_power(window, *self.frequency_bands['gamma'])
+
+        ratio_features = [
+            np.mean(beta / (alpha + theta)),
+            np.mean((beta + gamma) / (delta + theta)),
+            np.mean(theta / alpha),
+        ]
+        features.extend(ratio_features)
+
+        # Compute temporal stability
+        for band in [delta, theta, alpha, beta, gamma]:
+            features.append(np.mean(np.abs(np.diff(band))))
+
+        # Spectral entropy (using pre-computed power)
+        spectral_entropy = -np.sum(window * np.log2(window + 1e-10), axis=2).mean(axis=1)
+        features.extend(spectral_entropy)
+
+        # Time-domain features (adapted for frequency domain data)
+        hjorth_activity = np.var(window, axis=(0, 2)).mean()
+        hjorth_mobility = np.sqrt(np.var(np.diff(window, axis=0), axis=(0, 2)) / np.var(window, axis=(0, 2))).mean()
+        hjorth_complexity = (np.sqrt(np.var(np.diff(np.diff(window, axis=0), axis=0), axis=(0, 2)) / 
+                             np.var(np.diff(window, axis=0), axis=(0, 2))) / hjorth_mobility).mean()
+        features.extend([hjorth_activity, hjorth_mobility, hjorth_complexity])
+
+        # Wavelet features (adapted for frequency domain data)
+        wavelet_features = [np.mean(np.abs(window[:, :, i:i+8])) for i in range(0, window.shape[2], 8)]
+        features.extend(wavelet_features)
+
+        # Commitment feature
+        commitment = np.mean(beta) / (np.mean(alpha) + np.mean(theta))
+        features.append(commitment)
+
+        # Connectivity features
+        conn_features = self.compute_connectivity_features(window)
+        features.extend(conn_features)
+
+        return np.array(features)
+
+
+    def compute_band_power(self, data, low_freq, high_freq):
+        freq_bins = np.arange(60)  # 0-59 Hz
+        idx = np.logical_and(freq_bins >= low_freq, freq_bins < high_freq)
+        return np.mean(data[:, :, idx], axis=2)
+
+    def compute_connectivity_features(self, data):
+        # Compute connectivity across channels for each frequency bin
+        n_channels = data.shape[1]
+        n_freq_bins = data.shape[2]
+        connectivity = np.zeros((n_channels, n_channels, n_freq_bins))
+        
+        for f in range(n_freq_bins):
+            freq_data = data[:, :, f]
+            for i in range(n_channels):
+                for j in range(i+1, n_channels):
+                    connectivity[i, j, f] = np.abs(np.corrcoef(freq_data[:, i], freq_data[:, j])[0, 1])
+                    connectivity[j, i, f] = connectivity[i, j, f]
+        
+        # Compute summary statistics
+        mean_connectivity = np.mean(connectivity, axis=(0, 1))
+        max_connectivity = np.max(connectivity, axis=(0, 1))
+        std_connectivity = np.std(connectivity, axis=(0, 1))
+        
+        return np.concatenate([mean_connectivity, max_connectivity, std_connectivity])
     
-    def __init__(self, base_dir, fs=250, lowcut=1, highcut=60, n_ica_components=16, n_clusters=5):
-        super().__init__()
+    def debug_print(self, message):
+        print(f"[DEBUG] {message}")
+        
+class IntentCommitmentAnalyzer:
+    def __init__(self, time_threshold=1.0, commitment_threshold=0.6):
+        self.time_threshold = time_threshold
+        self.commitment_threshold = commitment_threshold
+
+    def analyze(self, predictions, commitments, timestamps):
+        intents = []
+        current_intent = None
+        intent_start = None
+        
+        for i, (pred, comm, time) in enumerate(zip(predictions, commitments, timestamps)):
+            if comm > self.commitment_threshold:
+                if current_intent is None:
+                    current_intent = pred
+                    intent_start = time
+                elif pred != current_intent:
+                    if time - intent_start >= self.time_threshold:
+                        intents.append((current_intent, intent_start, time))
+                    current_intent = pred
+                    intent_start = time
+            else:
+                if current_intent is not None:
+                    if time - intent_start >= self.time_threshold:
+                        intents.append((current_intent, intent_start, time))
+                    current_intent = None
+                    intent_start = None
+        
+        return intents
+    
+class AdaptiveWindowManager:
+    def __init__(self, base_window_size=5, max_stack_size=3, learning_rate=0.01):
+        self.base_window_size = base_window_size
+        self.max_stack_size = max_stack_size
+        self.learning_rate = learning_rate
+        self.stack_decision_model = self.build_stack_decision_model()
+        self.online_learning_rate = learning_rate * 0.1
+
+    def build_stack_decision_model(self):
+        eeg_input = Input(shape=(None, 16, 60))  # Variable time steps
+        feature_input = Input(shape=(None,))  # Variable number of features
+        performance_input = Input(shape=(1,))
+        
+        x = Conv2D(32, (3, 3), activation='relu')(eeg_input)
+        x = GlobalAveragePooling2D()(x)
+        
+        feature_x = Dense(32, activation='relu')(feature_input)
+        feature_x = GlobalAveragePooling1D()(feature_x)
+        
+        combined = Concatenate()([x, feature_x, performance_input])
+        x = Dense(64, activation='relu')(combined)
+        outputs = Dense(self.max_stack_size, activation='softmax')(x)
+        
+        model = Model(inputs=[eeg_input, feature_input, performance_input], outputs=outputs)
+        model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+        return model
+
+    def decide_stack_size(self, window, features, current_performance):
+        prediction = self.stack_decision_model.predict([
+            window[np.newaxis, ...], 
+            features[np.newaxis, ...], 
+            np.array([[current_performance]])
+        ])
+        return np.argmax(prediction[0]) + 1
+
+    def update(self, window, features, chosen_stack, performance):
+        target = np.zeros((1, self.max_stack_size))
+        target[0, chosen_stack - 1] = 1
+        
+        # Calculate performance improvement
+        if chosen_stack > 1:
+            prev_prediction = self.stack_decision_model.predict([
+                window[np.newaxis, ...], 
+                features[np.newaxis, ...], 
+                np.array([[0]])  # Assume no previous performance
+            ])
+            prev_stack = np.argmax(prev_prediction[0]) + 1
+            improvement = performance - prev_prediction[0, prev_stack - 1]
+        else:
+            improvement = performance
+        
+        # Train the model with the improvement as the performance input
+        self.stack_decision_model.train_on_batch(
+            [window[np.newaxis, ...], features[np.newaxis, ...], np.array([[improvement]])], 
+            target
+        )
+        
+    def update_online(self, window, features, chosen_stack, performance):
+        target = np.zeros((1, self.max_stack_size))
+        target[0, chosen_stack - 1] = 1
+        
+        # Use a custom training step with a lower learning rate
+        with tf.GradientTape() as tape:
+            predictions = self.stack_decision_model([window[np.newaxis, ...], 
+                                                     features[np.newaxis, ...], 
+                                                     np.array([[performance]])])
+            loss = tf.keras.losses.categorical_crossentropy(target, predictions)
+        
+        gradients = tape.gradient(loss, self.stack_decision_model.trainable_variables)
+        for grad, var in zip(gradients, self.stack_decision_model.trainable_variables):
+            var.assign_sub(self.online_learning_rate * grad)
+        
+#         # Update stack preferences based on overall performance
+#         accuracy = np.mean(np.argmax(predictions, axis=1) == np.argmax(true_labels, axis=1))
+#         self.stack_preferences += self.learning_rate * (accuracy - 0.5) * (self.stack_preferences - np.mean(self.stack_preferences))
+#         
+#         # Normalize preferences
+#         self.stack_preferences = np.clip(self.stack_preferences, 0.1, None)
+#         self.stack_preferences /= self.stack_preferences.sum()
+
+#     def get_stacked_window(self, data, start_index):
+#         stack_size = self.decide_stack_size(data[start_index:start_index+self.base_window_size])
+#         end_index = min(start_index + stack_size * self.base_window_size, len(data))
+#         return data[start_index:end_index]
+# 
+#     def get_context(self, data, center_index):
+#         start = max(0, center_index - self.context_size * self.base_window_size)
+#         end = min(len(data), center_index + (self.context_size + 1) * self.base_window_size)
+#         return data[start:end]
+    
+class EEGAnalysis:
+    def __init__(self, base_dir, fs=25):
         self.base_dir = base_dir
-        self.data_dir = os.path.join(base_dir, "model_data")
+        self.data_manager = DataManager(base_dir)
         self.logs_dir = os.path.join(base_dir, "logs")
         self.models_dir = os.path.join(base_dir, "models")
-        self.ensure_directories()
         self.fs = fs
-        self.lowcut = lowcut
-        self.highcut = highcut
-        self.n_ica_components = n_ica_components
-        self.n_clusters = n_clusters
-        self.data = {
-            'raw_data': {},
-            'cleaned_data': {},
-            'preprocessed_data': {},
-            'validation_data': {}
-        }
-        self.preprocessed_data = {}
-        self.preprocessing_settings = {}
-        self.ica_components = {}
-        self.cluster_labels = {}
         self.actions = set()
         self.models = {}
         self.frequency_bands = {
-            'delta': (1, 4),
-            'theta': (4, 8),
-            'alpha': (8, 13),
-            'beta': (13, 30),
-            'gamma': (30, 60)
+            'delta': (1, 4), 'theta': (4, 8), 'alpha': (8, 13),
+            'beta': (13, 30), 'gamma': (30, 60)
         }
+        self.setup_logging()
+        self.progress_queue = Queue()
+        self.progress_lock = Lock()
+        self.total_progress = 0
+        self.last_progress_update = 0
+        self.num_threads = multiprocessing.cpu_count() - 1 if multiprocessing.cpu_count() > 1 else 1
+        self.executor = ThreadPoolExecutor(max_workers=4)
+        self.window_size = 5  # 200ms at 25Hz
+        self.stride = 2  # 80ms at 25Hz
+        self.context_size = 2
+        self.overlap = 0.5
+        self.max_stack_size = 3
+        self.batch_size = 32
+        self.feature_version = 1
+        self.stack_specific_cnn_lstm_models = {}
+        self.stack_specific_unsupervised_models = {}
+        self.metadata = {
+            'window_size': self.window_size,
+            'stride': self.stride,
+            'context_size': self.context_size,
+            'overlap': self.overlap,
+            'max_stack_size': self.max_stack_size,
+            'feature_version': self.feature_version
+        }
+        self.adaptive_window_manager = AdaptiveWindowManager(base_window_size=self.window_size, 
+                                                             max_stack_size=self.max_stack_size, 
+                                                             context_size=self.context_size)
+        self.ts_extractor = TemporalSpectralFeatureExtractor(**self.metadata)
+        mlflow.set_tracking_uri("file:./mlruns")
+        mlflow.set_experiment("EEG_Analysis")
         
-        self.ensure_directories()
-        
-        # Set up logging
+    def update_progress(self, progress, message=""):
+        with self.progress_lock:
+            self.total_progress = progress
+            self.progress_queue.put((progress, message))
+                
+    def force_progress_complete(self, message="Task completed"):
+        with self.progress_lock:
+            self.total_progress = 100
+            self.last_progress_update = 100
+            self.progress_queue.put((100, message))
+
+            
+    def setup_logging(self):
         os.makedirs(self.logs_dir, exist_ok=True)
         log_file = os.path.join(self.logs_dir, f'eeg_analysis_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
         logging.basicConfig(filename=log_file, level=logging.INFO,
                             format='%(asctime)s - %(levelname)s - %(message)s')
         self.logger = logging.getLogger(__name__)
-        
-    def ensure_directories(self):
-        for dir_path in [self.data_dir, self.logs_dir, self.models_dir]:
-            os.makedirs(dir_path, exist_ok=True)
-        
-        for subdir in ["raw_data", "cleaned_data", "preprocessed_data", "validation_data"]:
-            os.makedirs(os.path.join(self.data_dir, subdir), exist_ok=True)
 
     def log_and_emit(self, message, level=logging.INFO):
         self.logger.log(level, message)
-        self.progress_update.emit(message)
-        
-    def get_data_for_visualization(self, data_type):
-        if data_type not in self.data:
-            self.log_and_emit(f"Invalid data type: {data_type}")
-            return None
+        self.update_progress(0, message)  # Update progress with message but no increment
+        return message
+    
+    def save_metadata(self):
+        metadata_path = os.path.join(self.base_dir, 'metadata.json')
+        with open(metadata_path, 'w') as f:
+            json.dump(self.metadata, f)
 
-        if not self.data[data_type]:
-            self.log_and_emit(f"No data available for {data_type}")
-            return None
+    def load_metadata(self):
+        metadata_path = os.path.join(self.base_dir, 'metadata.json')
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'r') as f:
+                self.metadata = json.load(f)
+                # Update class attributes from metadata
+                for key, value in self.metadata.items():
+                    setattr(self, key, value)
 
-        return self.data[data_type]
-
-    def load_data(self):
-        self.data = {key: {} for key in self.data.keys()}
+    def load_data(self, progress_callback=None):
         self.actions = set()
+        total_actions = sum(len(self.data_manager.get_actions(data_type)) for data_type in self.data_manager.data_catalog.keys())
+        processed_actions = 0
+        for data_type in self.data_manager.data_catalog.keys():
+            for action in self.data_manager.get_actions(data_type):
+                self.actions.add(action)
+                processed_actions += 1
+                progress = int((processed_actions / total_actions) * 100)
+                self.update_progress(progress, f"Loading {data_type}... {progress}%")
+        return self.log_data_summary()
 
-        for data_type in self.data.keys():
-            data_type_dir = os.path.join(self.data_dir, data_type)
-            if not os.path.exists(data_type_dir):
-                self.log_and_emit(f"Directory not found: {data_type_dir}")
-                continue
+    def log_data_summary(self):
+        summary = self.data_manager.get_data_summary()
+        self.logger.info(f"Loaded actions: {self.actions}")
+        self.logger.info("Data summary:")
+        for data_type, actions in summary.items():
+            self.logger.info(f"  {data_type}:")
+            for action, details in actions.items():
+                self.logger.info(f"    {action}: {details['count']} samples, shape: {details['shape']}")
+        return summary
 
-            for action in os.listdir(data_type_dir):
-                action_dir = os.path.join(data_type_dir, action)
-                if os.path.isdir(action_dir):
-                    self.actions.add(action)
-                    self.data[data_type][action] = []
-                    for file in os.listdir(action_dir):
-                        if file.endswith('.npy'):
-                            try:
-                                eeg_data = np.load(os.path.join(action_dir, file))
-                                if eeg_data.shape[1:] == (16, 60):
-                                    self.data[data_type][action].append(eeg_data)
-                                else:
-                                    self.log_and_emit(f"Skipping file with unexpected shape: {file}")
-                            except Exception as e:
-                                self.log_and_emit(f"Error loading file {file}: {str(e)}")
+    def clean_and_balance_data(self, progress_callback=None):
+        if not self.actions or not self.data_manager.get_actions('raw_data'):
+            return self.log_and_emit("No raw data available to clean and balance.")
 
-        self.log_and_emit(f"Loaded actions: {self.actions}")
-        self.log_and_emit(f"Data summary:")
-        for data_type, actions in self.data.items():
-            self.log_and_emit(f"  {data_type}:")
-            for action, data_list in actions.items():
-                self.log_and_emit(f"    {action}: {len(data_list)} samples")
+        # First pass: Count valid samples and store valid sample names
+        valid_sample_counts = {}
+        valid_sample_names = {}
+        for action in self.actions:
+            action_dir = os.path.join(self.data_manager.data_dir, "raw_data", action)
+            if os.path.exists(action_dir):
+                valid_samples = []
+                for sample_name in os.listdir(action_dir):
+                    if sample_name.endswith('.npy'):
+                        sample_path = os.path.join(action_dir, sample_name)
+                        try:
+                            sample = np.load(sample_path)
+                            if sample.shape == (250, 16, 60):
+                                valid_samples.append(sample_name)
+                        except Exception as e:
+                            self.log_and_emit(f"Error processing {sample_name} for action {action}: {str(e)}")
+                valid_sample_counts[action] = len(valid_samples)
+                valid_sample_names[action] = valid_samples
 
-    def preprocess_all_data(self):
-        for action, batches in self.data.items():
-            self.preprocessed_data[action] = [self.preprocess_eeg(batch, action) for batch in batches]
-            
-    def validate_data(self, data):
-        if np.isnan(data).any():
-            self.log_and_emit("Warning: NaN values detected in the data. Replacing with zeros.")
-            data = np.nan_to_num(data)
-        if np.isinf(data).any():
-            self.log_and_emit("Warning: Infinite values detected in the data. Replacing with large finite values.")
-            data = np.clip(data, -1e15, 1e15)
-        return data
+        # Determine the minimum number of valid samples across all actions
+        min_samples = min(valid_sample_counts.values())
+        if min_samples == 0:
+            return self.log_and_emit("No valid data available for cleaning and balancing.")
+
+        self.log_and_emit(f"Minimum number of valid samples across all actions: {min_samples}")
+
+        # Second pass: Save balanced data
+        total_samples_to_process = min_samples * len(self.actions)
+        processed_samples = 0
+
+        for action in self.actions:
+            np.random.shuffle(valid_sample_names[action])
+            for i, sample_name in enumerate(valid_sample_names[action][:min_samples]):
+                sample_path = os.path.join(self.data_manager.data_dir, "raw_data", action, sample_name)
+                sample = np.load(sample_path)
+                self.data_manager.save_data('cleaned_data', action, sample, sample_name)
+                processed_samples += 1
+                progress = int((processed_samples / total_samples_to_process) * 100)
+                self.update_progress(progress, f"Cleaning and balancing data... {progress}%")
+
+        # Verify the final counts
+        final_counts = {action: self.data_manager.get_sample_count('cleaned_data', action) for action in self.actions}
+        if len(set(final_counts.values())) != 1:
+            self.log_and_emit(f"Warning: Not all actions have the same number of samples after balancing. Counts: {final_counts}")
+
+        self.update_progress(100, "Data cleaning and balancing completed")
+        return self.log_and_emit(f"Data cleaning and balancing completed. Each action now has {min_samples} samples.")
     
-    def set_preprocessing_settings(self, action, settings):
-        self.preprocessing_settings[action] = settings
-
-    def preprocess_eeg(self, data, action):
-        settings = self.preprocessing_settings.get(action, {})
-        
-        # Bandpass filtering
-        lowcut = settings.get('lowcut', 1)
-        highcut = settings.get('highcut', 60)
-        filtered_data = self.apply_bandpass_filter(data, lowcut, highcut)
-        
-        # Notch filtering
-        notch_freq = settings.get('notch_freq', 50.0)
-        quality_factor = settings.get('quality_factor', 30.0)
-        notched_data = self.apply_notch_filter(filtered_data, notch_freq, quality_factor)
-        
-        # Adaptive filtering for artifact removal
-        mu = settings.get('adaptive_mu', 0.01)
-        order = settings.get('adaptive_order', 5)
-        adaptive_filtered_data = self.apply_adaptive_filter(notched_data, mu, order)
-        
-        # Artifact removal using FastICA
-        n_components = settings.get('ica_components', data.shape[2])
-        ica_data = self.apply_ica(adaptive_filtered_data, n_components)
-        
-        # Normalization
-        normalized_data = zscore(ica_data, axis=0)
-        
-        return normalized_data
+    def diff_summaries(self, initial, final):
+        diff = {}
+        for data_type in initial.keys():
+            diff[data_type] = {}
+            for action in set(initial[data_type].keys()) | set(final[data_type].keys()):
+                if action in initial[data_type] and action in final[data_type]:
+                    if initial[data_type][action] != final[data_type][action]:
+                        diff[data_type][action] = {
+                            'before': initial[data_type][action],
+                            'after': final[data_type][action]
+                        }
+                elif action in initial[data_type]:
+                    diff[data_type][action] = {'before': initial[data_type][action], 'after': 'Removed'}
+                else:
+                    diff[data_type][action] = {'before': 'Not present', 'after': final[data_type][action]}
+        return diff
     
-    def apply_bandpass_filter(self, data, lowcut, highcut):
-        nyq = 0.5 * self.fs
-        low = lowcut / nyq
-        high = highcut / nyq
-        b, a = signal.butter(4, [low, high], btype='band')
-        filtered_data = np.zeros_like(data)
-        for i in range(data.shape[1]):
-            filtered_data[:, i, :] = signal.filtfilt(b, a, data[:, i, :], axis=0)
-        return filtered_data
-
-    def apply_notch_filter(self, data, notch_freq, quality_factor):
-        b_notch, a_notch = signal.iirnotch(notch_freq, quality_factor, self.fs)
-        notched_data = np.zeros_like(data)
-        for i in range(data.shape[1]):
-            notched_data[:, i, :] = signal.filtfilt(b_notch, a_notch, data[:, i, :], axis=0)
-        return notched_data
-
-    def apply_adaptive_filter(self, data, mu=0.01, order=5):
-        filtered_data = np.zeros_like(data)
-        for channel in range(data.shape[1]):
-            for time_point in range(data.shape[2]):
-                x = data[:, channel, time_point]
-                d = x  # Desired signal (assuming noise is uncorrelated with the signal)
-                w = np.zeros(order)
-                for i in range(order, len(x)):
-                    x_i = x[i-order:i][::-1]
-                    y = np.dot(w, x_i)
-                    e = d[i] - y
-                    w_update = 2 * mu * e * x_i
-                    w += np.nan_to_num(w_update, nan=0.0, posinf=1e15, neginf=-1e15)
-                    filtered_data[i, channel, time_point] = y if not np.isnan(y) else x[i]
-        return filtered_data
-
-    def apply_ica(self, data, n_components):
-        ica = FastICA(n_components=n_components, random_state=42, max_iter=5000, tol=1e-4)
-        try:
-            ica_data = ica.fit_transform(data.reshape(-1, data.shape[-1])).reshape(data.shape)
-        except ValueError as e:
-            self.log_and_emit(f"FastICA failed. Using original data. Error: {e}")
-            ica_data = data
-        return ica_data
-
-    def cluster_ica_components(self):
-        kmeans = KMeans(n_clusters=self.n_clusters, random_state=42)
-        for action, batches in self.ica_components.items():
-            self.cluster_labels[action] = []
-            for batch in batches:
-                batch_2d = batch.reshape(-1, batch.shape[-1])
-                labels = kmeans.fit_predict(batch_2d)
-                self.cluster_labels[action].append(labels.reshape(batch.shape[0], -1))
-
-    def create_combined_model(self, input_shape, num_classes):
-        # CNN-LSTM branch
-        input_cnn = Input(shape=input_shape)
-        x_cnn = Conv1D(64, 3, activation='relu')(input_cnn)
-        x_cnn = MaxPooling1D(2)(x_cnn)
-        x_cnn = Conv1D(128, 3, activation='relu')(x_cnn)
-        x_cnn = MaxPooling1D(2)(x_cnn)
-        x_cnn = LSTM(64, return_sequences=True)(x_cnn)
-        x_cnn = LSTM(32)(x_cnn)
-        
-        # Transformer branch
-        input_transformer = Input(shape=input_shape)
-        x_transformer = input_transformer
-        for _ in range(2):  # 2 transformer blocks
-            x_transformer = MultiHeadAttention(num_heads=4, key_dim=32)(x_transformer, x_transformer)
-            x_transformer = LayerNormalization(epsilon=1e-6)(x_transformer)
-            x_transformer = Conv1D(filters=32, kernel_size=1, activation="relu")(x_transformer)
-            x_transformer = LayerNormalization(epsilon=1e-6)(x_transformer)
-        x_transformer = GlobalAveragePooling1D()(x_transformer)
-        
-        # Combine branches
-        combined = Concatenate()([x_cnn, x_transformer])
-        combined = Dense(64, activation='relu')(combined)
-        combined = Dropout(0.5)(combined)
-        output = Dense(num_classes, activation='softmax')(combined)
-        
-        model = Model(inputs=[input_cnn, input_transformer], outputs=output)
-        model.compile(optimizer=Adam(learning_rate=0.001),
-                      loss='categorical_crossentropy',
-                      metrics=['accuracy'])
-        return model
-
-    def train_combined_model(self, train_X, train_y, test_X, test_y, epochs=50, batch_size=32):
-        model = self.create_combined_model(train_X.shape[1:], len(self.actions))
-        early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-        model_checkpoint = ModelCheckpoint(f"{self.model_dir}/best_combined_model.h5", save_best_only=True, monitor='val_accuracy')
-        
-        history = model.fit([train_X, train_X], train_y, 
-                            batch_size=batch_size, 
-                            epochs=epochs, 
-                            validation_data=([test_X, test_X], test_y),
-                            callbacks=[early_stopping, model_checkpoint])
-        
-        self.models['combined'] = model
-        self.plot_training_history(history)
-        return model
+#     def update_rf_model(self, train_X, train_y):
+#         rf = self.models['rf']
+#         rf.fit(train_X.reshape(train_X.shape[0], -1), np.argmax(train_y, axis=1))
+#         joblib.dump(rf, os.path.join(self.models_dir, 'rf_model.joblib'))
+# 
+#     def train_rf_model(self, train_X, train_y):
+#         return self.optimize_rf_model(train_X, train_y)
+# 
+#     def optimize_rf_model(self, train_data, val_data):
+#         param_grid = {
+#             'n_estimators': [100, 200, 300],
+#             'max_depth': [10, 20, 30, None],
+#             'min_samples_split': [2, 5, 10],
+#             'min_samples_leaf': [1, 2, 4]
+#         }
+#         rf = RandomForestClassifier(random_state=42)
+#         
+#         # Prepare data for GridSearchCV
+#         X_train, y_train = [], []
+#         for batch_X, batch_y in train_data:
+#             X_train.extend(batch_X.reshape(batch_X.shape[0], -1))
+#             y_train.extend(np.argmax(batch_y, axis=1))
+#         
+#         X_train = np.array(X_train)
+#         y_train = np.array(y_train)
+#         
+#         grid_search = GridSearchCV(estimator=rf, param_grid=param_grid, cv=5, n_jobs=-1, verbose=2, scoring='accuracy')
+#         grid_search.fit(X_train, y_train)
+#         
+#         self.log_and_emit(f"Best parameters found: {grid_search.best_params_}")
+#         self.log_and_emit(f"Best cross-validation score: {grid_search.best_score_:.4f}")
+#         
+#         self.models['optimized_rf'] = grid_search.best_estimator_
+#         return self.models['optimized_rf']
 
     def plot_training_history(self, history):
         plt.figure(figsize=(12, 4))
@@ -285,46 +520,30 @@ class EEGAnalysis(QObject):
         plt.legend()
 
         plt.tight_layout()
+        
+        # Save the plot
+        plot_path = os.path.join(self.models_dir, 'training_history.png')
+        plt.savefig(plot_path)
+        mlflow.log_artifact(plot_path)
+        
         plt.show()
 
-    def train_rf_model(self, train_X, train_y):
-        return self.optimize_rf_model(train_X, train_y)
-
-    def optimize_rf_model(self, X, y):
-        param_grid = {
-            'n_estimators': [100, 200, 300],
-            'max_depth': [10, 20, 30, None],
-            'min_samples_split': [2, 5, 10],
-            'min_samples_leaf': [1, 2, 4]
-        }
-        rf = RandomForestClassifier(random_state=42)
-        grid_search = GridSearchCV(estimator=rf, param_grid=param_grid, cv=5, n_jobs=-1, verbose=2)
-        grid_search.fit(X, y)
+    def evaluate_model(self, model_type, test_data):
+        y_pred = []
+        y_true = []
         
-        self.log_and_emit("Best parameters found: ", grid_search.best_params_)
-        self.log_and_emit("Best cross-validation score: {:.2f}".format(grid_search.best_score_))
+        for batch_data, batch_labels in test_data:
+            processed_data = self.process_data_with_adaptive_windows(batch_data)
+            batch_pred = self.predict_with_stack_specific_models(processed_data)
+            y_pred.extend(batch_pred)
+            y_true.extend(batch_labels)
         
-        self.models['rf'] = grid_search.best_estimator_
-        return self.models['rf']
-
-    def evaluate_model(self, model_type, test_X, test_y):
-        model = self.models.get(model_type)
-        if model is None:
-            self.log_and_emit(f"No {model_type} model found. Please train the model first.")
-            return None
-
-        if model_type in ['combined', 'optimized_nn']:
-            y_pred = model.predict([test_X, test_X])
-            y_pred_classes = np.argmax(y_pred, axis=1)
-            y_true_classes = np.argmax(test_y, axis=1)
-        else:  # RF model
-            y_pred = model.predict(test_X.reshape(test_X.shape[0], -1))
-            y_pred_classes = y_pred
-            y_true_classes = np.argmax(test_y, axis=1)
-
-        accuracy = accuracy_score(y_true_classes, y_pred_classes)
-        conf_matrix = confusion_matrix(y_true_classes, y_pred_classes)
-        class_report = classification_report(y_true_classes, y_pred_classes, target_names=self.actions)
+        y_pred = np.array(y_pred)
+        y_true = np.array(y_true)
+        
+        accuracy = accuracy_score(np.argmax(y_true, axis=1), np.argmax(y_pred, axis=1))
+        conf_matrix = confusion_matrix(np.argmax(y_true, axis=1), np.argmax(y_pred, axis=1))
+        class_report = classification_report(np.argmax(y_true, axis=1), np.argmax(y_pred, axis=1), target_names=self.actions)
 
         self.log_and_emit(f"{model_type.upper()} Model Evaluation:")
         self.log_and_emit(f"Accuracy: {accuracy:.4f}")
@@ -341,6 +560,32 @@ class EEGAnalysis(QObject):
             'classification_report': class_report
         }
 
+    def evaluate_unsupervised_models(self, stack_size, val_data):
+        unsupervised_models = self.stack_specific_unsupervised_models[stack_size]
+        
+        autoencoder_loss = 0
+        recurrent_loss = 0
+        dec_loss = 0
+        som_quantization_error = 0
+        num_samples = 0
+        
+        for batch_data, _ in val_data:
+            processed_data = self.process_data_with_adaptive_windows(batch_data)
+            stack_data = [sample for sample in processed_data if sample[2] == stack_size]
+            
+            for stacked_window, _, _, _ in stack_data:
+                autoencoder_loss += unsupervised_models['autoencoder'][0].test_on_batch(stacked_window[np.newaxis, ...], stacked_window[np.newaxis, ...])
+                recurrent_loss += unsupervised_models['recurrent_autoencoder'].test_on_batch(stacked_window[np.newaxis, ...], stacked_window[np.newaxis, ...])
+                dec_loss += unsupervised_models['dec_model'].test_on_batch(stacked_window[np.newaxis, ...], None)
+                som_quantization_error += unsupervised_models['som'].quantization_error(stacked_window.flatten())
+                num_samples += 1
+        
+        self.log_and_emit(f"Stack size {stack_size} unsupervised model evaluation:")
+        self.log_and_emit(f"Autoencoder loss: {autoencoder_loss / num_samples}")
+        self.log_and_emit(f"Recurrent autoencoder loss: {recurrent_loss / num_samples}")
+        self.log_and_emit(f"DEC model loss: {dec_loss / num_samples}")
+        self.log_and_emit(f"SOM quantization error: {som_quantization_error / num_samples}")
+
     def plot_confusion_matrix(self, cm, classes, title='Confusion Matrix', cmap=plt.cm.Blues):
         plt.figure(figsize=(10, 8))
         sns.heatmap(cm, annot=True, fmt='d', cmap=cmap, xticklabels=classes, yticklabels=classes)
@@ -350,57 +595,435 @@ class EEGAnalysis(QObject):
         plt.tight_layout()
         plt.show()
 
-    def extract_features(self, eeg_data):
-        features = []
+    def get_feature_shape(self):
+        # Get the shape of a single feature set
+        for action in self.data_manager.get_actions('features'):
+            feature = self.data_manager.load_data('features', action, 0)
+            if feature is not None:
+                return feature.shape
+        raise ValueError("No features found to determine shape")
+
+    def build_stack_specific_models(self):
+        for stack_size in range(1, self.max_stack_size + 1):
+            self.stack_specific_unsupervised_models[stack_size] = {
+                'autoencoder': self.build_autoencoder(stack_size),
+                'dec_model': self.build_dec_model(stack_size),
+                'recurrent_autoencoder': self.build_recurrent_autoencoder(stack_size),
+                'som': MiniSom(10, 10, self.window_size * 16 * 60 * stack_size, sigma=1.0, learning_rate=0.5)
+            }
+            self.stack_specific_cnn_lstm_models[stack_size] = self.build_tunable_cnn_lstm_model(stack_size)
+
+    def build_autoencoder(self, stack_size):
+        input_shape = (self.window_size, 16, 60 * stack_size)
+        inputs = Input(shape=input_shape)
         
-        # Spectral power features
-        for band, (low, high) in self.frequency_bands.items():
-            band_power = self.compute_band_power(eeg_data, low, high)
-            features.append(np.mean(band_power))
-            features.append(np.std(band_power))
+        # Encoder
+        x = TimeDistributed(Dense(32, activation='relu'))(inputs)
+        x = LSTM(64, return_sequences=True)(x)
+        encoded = LSTM(32, return_sequences=False)(x)
         
-        # Time-domain features
-        hjorth_activity = np.var(eeg_data, axis=0).mean()
-        hjorth_mobility = np.sqrt(np.var(np.diff(eeg_data, axis=0), axis=0) / np.var(eeg_data, axis=0)).mean()
-        hjorth_complexity = (np.sqrt(np.var(np.diff(np.diff(eeg_data, axis=0), axis=0), axis=0) / 
-                             np.var(np.diff(eeg_data, axis=0), axis=0)) / hjorth_mobility).mean()
-        features.extend([hjorth_activity, hjorth_mobility, hjorth_complexity])
+        # Decoder
+        x = Dense(64, activation='relu')(encoded)
+        x = Dense(128, activation='relu')(x)
+        decoded = Dense(self.window_size * 16 * 60, activation='linear')(x)
+        decoded = Reshape((self.window_size, 16, 60))(decoded)
         
-        # Frequency-domain features
-        freqs, psd = welch(eeg_data, fs=self.fs, nperseg=self.fs)
-        spectral_entropy = -np.sum(psd * np.log2(psd), axis=1).mean()
-        features.append(spectral_entropy)
+        autoencoder = Model(inputs, decoded)
+        encoder = Model(inputs, encoded)
         
-        # Wavelet transform features
-        wavelet = 'db4'
-        coeffs = pywt.wavedec(eeg_data, wavelet, level=5)
-        wavelet_features = [np.mean(np.abs(c)) for c in coeffs]
-        features.extend(wavelet_features)
+        autoencoder.compile(optimizer='adam', loss='mse')
         
-        # Connectivity features
-        # Reshape eeg_data if necessary to match the expected input format
-        eeg_epochs = eeg_data.reshape(1, *eeg_data.shape)  # Add a singleton dimension for epochs
-        conn, _, _, _, _ = spectral_connectivity_epochs(eeg_epochs, method='wpli', sfreq=self.fs, fmin=1, fmax=60, n_jobs=1)
-        features.extend(conn.mean(axis=2).flatten())
+        return autoencoder, encoder
+    
+    def build_dec_model(self, stack_size):
+        input_shape = (self.window_size, 16, 60 * stack_size)
+        inputs = Input(shape=input_shape)
+        x = TimeDistributed(Dense(64, activation='relu'))(inputs)
+        x = LSTM(32, return_sequences=False)(x)
+        clustering_layer = ClusteringLayer(n_clusters=5)(x)  # Adjust n_clusters as needed
         
-        return np.array(features)
+        model = Model(inputs=inputs, outputs=clustering_layer)
+        model.compile(optimizer='adam', loss='kld')
+        
+        return model
+
+    def build_recurrent_autoencoder(self, stack_size):
+        input_shape = (self.window_size, 16, 60 * stack_size)
+        inputs = Input(shape=input_shape)
+        
+        # Encoder
+        encoded = LSTM(64, return_sequences=True)(inputs)
+        encoded = LSTM(32, return_sequences=False)(encoded)
+        
+        # Decoder
+        decoded = RepeatVector(self.window_size)(encoded)
+        decoded = LSTM(32, return_sequences=True)(decoded)
+        decoded = TimeDistributed(Dense(16 * 60))(decoded)
+        decoded = Reshape((self.window_size, 16, 60))(decoded)
+        
+        model = Model(inputs, decoded)
+        model.compile(optimizer='adam', loss='mse')
+        
+        return model
+    
+    def build_tunable_cnn_lstm_model(self, stack_size):
+        def create_model(hp):
+            input_shape = (None, self.window_size, 16, 60 * stack_size)
+            num_classes = len(self.actions)
+
+            # Use the same model architecture as in optimize_combined_model
+            input_layer = Input(shape=(None, input_shape[1]))
+            x_cnn = Conv1D(hp.Int('cnn_filters_1', 32, 128, step=32), 
+                           hp.Int('cnn_kernel_1', 3, 9, step=2), 
+                           activation='relu')(input_layer)
+            x_cnn = MaxPooling1D(2)(x_cnn)
+            x_cnn = Conv1D(hp.Int('cnn_filters_2', 64, 256, step=64), 
+                           hp.Int('cnn_kernel_2', 3, 9, step=2), 
+                           activation='relu')(x_cnn)
+            x_cnn = MaxPooling1D(2)(x_cnn)
+            
+            temp_attention = Attention()([x_cnn, x_cnn])
+            x_cnn = Concatenate()([x_cnn, temp_attention])
+            
+            x_cnn = LSTM(hp.Int('lstm_units_1', 32, 128, step=32), return_sequences=True)(x_cnn)
+            x_cnn = LSTM(hp.Int('lstm_units_2', 16, 64, step=16))(x_cnn)
+            
+            x_transformer = input_layer
+            for _ in range(hp.Int('num_transformer_blocks', 1, 3)):
+                x_transformer = MultiHeadAttention(num_heads=hp.Int('num_heads', 2, 8),
+                                                   key_dim=hp.Int('key_dim', 16, 64, step=16))(x_transformer, x_transformer)
+                x_transformer = LayerNormalization(epsilon=1e-6)(x_transformer)
+                x_transformer = Conv1D(filters=hp.Int('transformer_conv_filters', 16, 64, step=16),
+                                       kernel_size=1, activation="relu")(x_transformer)
+                x_transformer = LayerNormalization(epsilon=1e-6)(x_transformer)
+            x_transformer = GlobalAveragePooling1D()(x_transformer)
+            
+            combined = Concatenate()([x_cnn, x_transformer])
+            combined = Dense(hp.Int('dense_units', 32, 128, step=32), activation='relu')(combined)
+            output = Dense(num_classes, activation='softmax')(combined)
+            
+            model = Model(inputs=input_layer, outputs=output)
+            model.compile(optimizer=Adam(hp.Float('learning_rate', 1e-4, 1e-2, sampling='LOG')),
+                          loss='categorical_crossentropy',
+                          metrics=['accuracy'])
+            return model
+        
+        return kt.Hyperband(
+            create_model,
+            objective='val_accuracy',
+            max_epochs=50,
+            factor=3,
+            directory=f'cnn_lstm_tuning_stack_{stack_size}',
+            project_name=f'EEG_cnn_lstm_tuning_stack_{stack_size}'
+        )
+    
+    def evaluate_epoch(self):
+        val_loss = 0
+        val_acc = 0
+        num_batches = 0
+        
+        for batch_data, batch_labels in self.raw_data_generator('validation_data'):
+            processed_data = self.process_data_with_adaptive_windows(batch_data)
+            
+            batch_loss = 0
+            batch_acc = 0
+            for stack_size in range(1, self.max_stack_size + 1):
+                stack_data = [sample for sample in processed_data if sample[2] == stack_size]
+                if stack_data:
+                    stack_features = np.array([sample[3] for sample in stack_data])
+                    stack_labels = np.array([label for label, sample in zip(batch_labels, processed_data) if sample[2] == stack_size])
+                    
+                    y_pred = self.stack_specific_cnn_lstm_models[stack_size].predict(stack_features)
+                    
+                    loss = tf.keras.losses.categorical_crossentropy(stack_labels, y_pred).numpy().mean()
+                    acc = tf.keras.metrics.categorical_accuracy(stack_labels, y_pred).numpy().mean()
+                    
+                    batch_loss += loss
+                    batch_acc += acc
+            
+            val_loss += batch_loss / self.max_stack_size
+            val_acc += batch_acc / self.max_stack_size
+            num_batches += 1
+        
+        return val_loss / num_batches, val_acc / num_batches
+
 
     def compute_band_power(self, eeg_data, low_freq, high_freq):
         freq_mask = np.logical_and(np.arange(eeg_data.shape[2]) >= low_freq, 
                                    np.arange(eeg_data.shape[2]) < high_freq)
         return np.mean(eeg_data[:, :, freq_mask], axis=(0, 2))
+    
+    def normalize_features(self, features):
+        return (features - np.mean(features, axis=0)) / np.std(features, axis=0)
 
-    def prepare_data_for_training(self):
-        X = []
-        y = []
-        for action_index, action in enumerate(self.actions):
-            for batch in self.preprocessed_data[action]:
-                X.append(batch)
-                y.append(action_index)
-        X = np.array(X)
-        y = np.eye(len(self.actions))[y]  # One-hot encode the labels
-        return train_test_split(X, y, test_size=0.2, random_state=42)
+    def extract_combined_features(self, stacked_window, stack_size):
+        # Extract unsupervised features
+        unsupervised_models = self.stack_specific_unsupervised_models[stack_size]
+        autoencoder_features = unsupervised_models['autoencoder'].encoder.predict(stacked_window[np.newaxis, ...])
+        dec_features = unsupervised_models['dec_model'].predict(stacked_window[np.newaxis, ...])
+        recurrent_features = unsupervised_models['recurrent_autoencoder'].get_layer('encoder').predict(stacked_window[np.newaxis, ...])
+        som_features = np.array([unsupervised_models['som'].winner(stacked_window.flatten())])
+        
+        # Combine unsupervised features
+        unsupervised_features = np.concatenate([
+            autoencoder_features.flatten(),
+            dec_features.flatten(),
+            recurrent_features.flatten(),
+            som_features.flatten()
+        ])
+        
+        # Extract hand-crafted features
+        handcrafted_features = self.ts_extractor.extract_features_from_window(stacked_window)
+        
+        # Combine all features
+        return np.concatenate([unsupervised_features, handcrafted_features])
 
+    def raw_data_generator(self, data_type='cleaned_data', batch_size=32):
+        while True:
+            for action in self.actions:
+                sample_count = self.data_manager.get_sample_count(data_type, action)
+                for i in range(0, sample_count, batch_size):
+                    batch_data = []
+                    batch_labels = []
+                    for j in range(i, min(i + batch_size, sample_count)):
+                        data = self.data_manager.load_data(data_type, action, j)
+                        if data is not None:
+                            processed_data = self.process_data_with_adaptive_windows(data, is_batch=False)
+                            batch_data.extend(processed_data)
+                            batch_labels.extend([self.actions.index(action)] * len(processed_data))
+                    
+                    if batch_data:
+                        yield batch_data, np.eye(len(self.actions))[batch_labels]
+
+    def integrated_training(self, epochs=10, batch_size=32):
+        self.build_stack_specific_models()
+        
+#         # Callbacks
+#         early_stopping = 
+#         model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
+#             os.path.join(self.models_dir, 'integrated_optimized_model.h5'),
+#             save_best_only=True, monitor='val_accuracy'
+#         )
+
+        with mlflow.start_run(run_name="integrated_training"):
+            for epoch in range(epochs):
+                self.log_and_emit(f"Epoch {epoch+1}/{epochs}")
+
+                # Perform hyperparameter tuning every `tuning_frequency` epochs or at the start
+                if epoch % tuning_frequency == 0:
+                    for stack_size, tuner in self.stack_specific_cnn_lstm_models.items():
+                        self.log_and_emit(f"Tuning CNN-LSTM model for stack size {stack_size}")
+                        tuner.search(
+                            self.raw_data_generator('cleaned_data', batch_size),
+                            epochs=1,  # Reduce epochs for quicker tuning
+                            validation_data=self.raw_data_generator('validation_data', batch_size),
+                            callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3)]
+                        )
+                        best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+                        self.stack_specific_cnn_lstm_models[stack_size] = tuner.hypermodel.build(best_hps)
+
+                for batch_data, batch_labels in self.raw_data_generator('cleaned_data', batch_size):
+                    processed_data = self.process_data_with_adaptive_windows(batch_data)
+                    
+                    # Train unsupervised models
+                    self.train_unsupervised_models(processed_data)
+                    
+                    # Train CNN-LSTM models with progressive stacking
+                    stack_performances = self.train_cnn_lstm_models_progressive(processed_data, batch_labels)
+                    
+                    # Update unsupervised models' weights based on CNN-LSTM performance
+                    for sample_performance in stack_performances:
+                        for stack_size, (accuracy, stacked_window, features) in sample_performance:
+                            unsupervised_models = self.stack_specific_unsupervised_models[stack_size]
+                            weight_update = accuracy * self.learning_rate
+                            for model in [unsupervised_models['autoencoder'][0], unsupervised_models['recurrent_autoencoder'], unsupervised_models['dec_model']]:
+                                for layer in model.layers:
+                                    if hasattr(layer, 'kernel'):
+                                        layer.kernel.assign_add(layer.kernel * weight_update)
+                                    if hasattr(layer, 'bias'):
+                                        layer.bias.assign_add(layer.bias * weight_update)
+
+                    # Update AdaptiveWindowManager
+                    for sample_performance in stack_performances:
+                        current_performance = 0
+                        for stack_size, (accuracy, stacked_window, features) in enumerate(sample_performance, start=1):
+                            self.adaptive_window_manager.update(stacked_window, features, stack_size, accuracy)
+                            if accuracy <= current_performance:
+                                break
+                            current_performance = accuracy
+                
+                val_loss, val_acc = self.evaluate_epoch()
+                self.log_and_emit(f"Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_acc:.4f}")
+                mlflow.log_metric(f"epoch_{epoch+1}_val_loss", val_loss)
+                mlflow.log_metric(f"epoch_{epoch+1}_val_accuracy", val_acc)
+                
+                if (epoch + 1) % 5 == 0:
+                    self.save_models(epoch + 1)
+                    self.update_learning_rates()
+
+            self.save_models('final')
+
+        return self.stack_specific_cnn_lstm_models, self.stack_specific_unsupervised_models, self.adaptive_window_manager
+    
+    def process_data_with_adaptive_windows(self, data, is_batch=True):
+        if is_batch:
+            return [self._process_single_sample(sample) for sample in data]
+        else:
+            return self._process_single_sample(data)
+
+    def _process_batch(self, batch_data):
+        return [self._process_single_sample(sample) for sample in batch_data]
+
+    def _process_single_sample(self, sample):
+        windows = self.ts_extractor.create_sliding_windows(sample)
+        processed_windows = []
+        for i in range(len(windows)):
+            stack_size = self.adaptive_window_manager.decide_stack_size(windows[i])
+            stacked_window = self.get_stacked_window(sample, i, stack_size)
+            context = self.get_context(sample, i)
+            features = self.extract_combined_features(stacked_window, stack_size)
+            processed_windows.append((stacked_window, context, stack_size, features))
+        return processed_windows
+    
+    def get_stacked_window(self, data, start_index, stack_size):
+        end_index = min(start_index + stack_size * self.window_size, len(data))
+        return data[start_index:end_index]
+
+    def get_context(self, data, center_index):
+        start = max(0, center_index - self.context_size * self.window_size)
+        end = min(len(data), center_index + (self.context_size + 1) * self.window_size)
+        return data[start:end]
+    
+    def predict_with_stack_specific_models(self, batch_data):
+        predictions = []
+        for sample in batch_data:
+            sample_predictions = []
+            for _, _, stack_size, features in sample:
+                model = self.stack_specific_cnn_lstm_models[stack_size]
+                pred = model.predict(features[np.newaxis, ...])
+                sample_predictions.append(pred[0])
+            predictions.append(np.mean(sample_predictions, axis=0))
+        return np.array(predictions)
+
+    def train_unsupervised_models(self, processed_data):
+        for sample in processed_data:
+            for stacked_window, _, stack_size, _ in sample:
+                unsupervised_models = self.stack_specific_unsupervised_models[stack_size]
+                
+                # Train autoencoder
+                unsupervised_models['autoencoder'][0].train_on_batch(stacked_window[np.newaxis, ...], stacked_window[np.newaxis, ...])
+                
+                # Train recurrent autoencoder
+                unsupervised_models['recurrent_autoencoder'].train_on_batch(stacked_window[np.newaxis, ...], stacked_window[np.newaxis, ...])
+                
+                # Train DEC model
+                unsupervised_models['dec_model'].train_on_batch(stacked_window[np.newaxis, ...], None)
+                
+                # Train SOM
+                unsupervised_models['som'].update(stacked_window.flatten(), unsupervised_models['som'].winner(stacked_window.flatten()), 0)
+                    
+    def train_cnn_lstm_models_progressive(self, processed_data, batch_labels):
+        stack_performances = []
+        for sample, label in zip(processed_data, batch_labels):
+            sample_performance = []
+            current_performance = 0
+            for stack_size, (stacked_window, _, _, features) in enumerate(sample, start=1):
+                model = self.stack_specific_cnn_lstm_models[stack_size]
+                # Use both stacked_window and features
+                performance = model.train_on_batch([stacked_window[np.newaxis, ...], features[np.newaxis, ...]], label[np.newaxis, ...])
+                accuracy = performance[1]  # Assuming accuracy is the second metric
+                
+                sample_performance.append((accuracy, stacked_window, features))
+                if accuracy <= current_performance:
+                    break  # Stop if no improvement with larger stack
+                current_performance = accuracy
+            
+            stack_performances.append(sample_performance)
+        return stack_performances
+            
+    def save_models(self, identifier):
+        for stack_size, model in self.stack_specific_cnn_lstm_models.items():
+            model.save(os.path.join(self.models_dir, f'cnn_lstm_model_stack_{stack_size}_{identifier}.h5'))
+            mlflow.keras.log_model(model, f"cnn_lstm_model_stack_{stack_size}_{identifier}")
+        
+        for stack_size, models in self.stack_specific_unsupervised_models.items():
+            for model_name, model in models.items():
+                if isinstance(model, tf.keras.Model):
+                    model.save(os.path.join(self.models_dir, f'{model_name}_stack_{stack_size}_{identifier}.h5'))
+                    mlflow.keras.log_model(model, f"{model_name}_stack_{stack_size}_{identifier}")
+                else:
+                    with open(os.path.join(self.models_dir, f'{model_name}_stack_{stack_size}_{identifier}.pkl'), 'wb') as f:
+                        pickle.dump(model, f)
+                    mlflow.log_artifact(os.path.join(self.models_dir, f'{model_name}_stack_{stack_size}_{identifier}.pkl'), f"{model_name}_stack_{stack_size}_{identifier}")
+        
+        with open(os.path.join(self.models_dir, f'adaptive_window_manager_{identifier}.pkl'), 'wb') as f:
+            pickle.dump(self.adaptive_window_manager, f)
+        mlflow.log_artifact(os.path.join(self.models_dir, f'adaptive_window_manager_{identifier}.pkl'), f"adaptive_window_manager_{identifier}")
+
+    def update_learning_rates(self):
+        for stack_size in range(1, self.max_stack_size + 1):
+            # Update CNN-LSTM model learning rate
+            cnn_lstm_model = self.stack_specific_cnn_lstm_models[stack_size]
+            K.set_value(cnn_lstm_model.optimizer.learning_rate, K.get_value(cnn_lstm_model.optimizer.learning_rate) * 0.9)
+            
+            # Update unsupervised models learning rates
+            unsupervised_models = self.stack_specific_unsupervised_models[stack_size]
+            for model in [unsupervised_models['autoencoder'][0], unsupervised_models['recurrent_autoencoder'], unsupervised_models['dec_model']]:
+                K.set_value(model.optimizer.learning_rate, K.get_value(model.optimizer.learning_rate) * 0.9)
+            
+            # Update SOM learning rate
+            unsupervised_models['som'].learning_rate *= 0.9
+        
+        # Update AdaptiveWindowManager learning rate
+        self.adaptive_window_manager.learning_rate *= 0.9
+
+    def extract_features(self, processed_data):
+        features = []
+        for sample in processed_data:
+            sample_features = []
+            for stacked_window, context, stack_size in sample:
+                unsupervised_models = self.stack_specific_unsupervised_models[stack_size]
+                
+                # Extract features using unsupervised models
+                autoencoder_features = unsupervised_models['autoencoder'].encoder.predict(stacked_window[np.newaxis, ...])
+                dec_features = unsupervised_models['dec_model'].predict(stacked_window[np.newaxis, ...])
+                recurrent_features = unsupervised_models['recurrent_autoencoder'].get_layer('encoder').predict(stacked_window[np.newaxis, ...])
+                som_features = np.array([unsupervised_models['som'].winner(stacked_window.flatten())])
+                
+                # Combine features
+                combined_features = np.concatenate([
+                    autoencoder_features.flatten(),
+                    dec_features.flatten(),
+                    recurrent_features.flatten(),
+                    som_features.flatten()
+                ])
+                
+                # Add hand-crafted features
+                handcrafted_features = self.ts_extractor.extract_features_from_window(stacked_window)
+                
+                # Combine all features
+                window_features = np.concatenate([combined_features, handcrafted_features])
+                
+#                 # If labels are provided, calculate feature importance
+#                 if labels is not None:
+#                     # Use mutual information for feature importance
+#                     feature_importance = mutual_info_classif(window_features[np.newaxis, ...], labels)
+#                     # Normalize feature importance
+#                     feature_importance = feature_importance / np.sum(feature_importance)
+#                     # Append feature importance to window features
+#                     window_features = np.concatenate([window_features, feature_importance])
+
+                sample_features.append(window_features)
+            features.append(np.array(sample_features))
+        
+        return np.array(features)
+    
+    def update_feature_extraction(self):
+        self.feature_version += 1
+        self.data_manager.clear_cached_features(self.feature_version)
+        self.log_and_emit(f"Updated feature extraction to version {self.feature_version}")
+
+                            
     def cross_validate_models(self, X, y, n_splits=5):
         kfold = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
         
@@ -442,255 +1065,149 @@ class EEGAnalysis(QObject):
         theta_power = np.mean(self.compute_band_power(eeg_data, *self.frequency_bands['theta']))
         commitment = beta_power / (alpha_power + theta_power)
         return commitment
+    
+    def analyze_intent_and_commitment(self, predictions, commitments, timestamps):
+        intents = []
+        current_intent = None
+        intent_start = None
+        
+        for i, (pred, comm, time) in enumerate(zip(predictions, commitments, timestamps)):
+            if comm > self.commitment_threshold:
+                if current_intent is None:
+                    current_intent = pred
+                    intent_start = time
+                elif pred != current_intent:
+                    if time - intent_start >= self.time_threshold:
+                        intents.append((current_intent, intent_start, time))
+                    current_intent = pred
+                    intent_start = time
+            else:
+                if current_intent is not None:
+                    if time - intent_start >= self.time_threshold:
+                        intents.append((current_intent, intent_start, time))
+                    current_intent = None
+                    intent_start = None
+        
+        return intents
 
-    def detect_intent(self, eeg_data, window_size=10, overlap=5):
+    def detect_intent(self, live_eeg_data, max_latency=200):
+        processed_data = self.process_data_with_adaptive_windows(live_eeg_data, is_batch=False)
         predictions = []
         commitments = []
+        timestamps = []
         
-        for i in range(0, len(eeg_data) - window_size + 1, overlap):
-            window = eeg_data[i:i+window_size]
+        for i, sample in enumerate(processed_data):
+            multi_scale_predictions = []
+            multi_scale_confidences = []
+            current_performance = 0
             
-            # Use combined model for action prediction
-            action_pred = self.models['combined'].predict([window.reshape(1, *window.shape), window.reshape(1, *window.shape)])
-            predicted_action = self.actions[np.argmax(action_pred)]
+            for stack_size, (window, _, _, features) in enumerate(sample, start=1):
+                if stack_size > 1:
+                    # Use AdaptiveWindowManager to decide whether to continue stacking
+                    if self.adaptive_window_manager.decide_stack_size(window, features, current_performance) < stack_size:
+                        break
+
+                model = self.stack_specific_cnn_lstm_models[stack_size]
+                pred = model.predict(features[np.newaxis, ...])[0]
+                confidence = np.max(pred)
+                
+                if confidence > current_performance:
+                    current_performance = confidence
+                    multi_scale_predictions.append(pred)
+                    multi_scale_confidences.append(confidence)
+                else:
+                    break  # Stop if no improvement with larger stack
             
-            # Analyze commitment
-            commitment = self.analyze_commitment(window)
+            # Choose the prediction with the highest confidence
+            best_scale = np.argmax(multi_scale_confidences)
+            predicted_action = self.actions[np.argmax(multi_scale_predictions[best_scale])]
+            commitment = self.analyze_commitment(sample[0][0])  # Use the first window for commitment analysis
             
             predictions.append(predicted_action)
             commitments.append(commitment)
-        
-        return predictions, commitments
+            timestamps.append(i * self.stride / self.fs)
+            
+            # Check if we've exceeded the maximum latency
+            if timestamps[-1] * 1000 > max_latency:
+                break
 
-    def visualize_intent_and_commitment(self, predictions, commitments):
-        plt.figure(figsize=(12, 6))
+        return predictions, commitments, timestamps
+
+    def visualize_intent_and_commitment(self, predictions, commitments, timestamps, intents):
+        plt.figure(figsize=(12, 8))
         
         # Plot predicted actions
-        plt.subplot(2, 1, 1)
+        plt.subplot(3, 1, 1)
         action_indices = [self.actions.index(action) for action in predictions]
-        plt.plot(action_indices, marker='o')
+        plt.plot(timestamps, action_indices, marker='o')
         plt.yticks(range(len(self.actions)), self.actions)
         plt.title('Predicted Actions Over Time')
-        plt.xlabel('Time Window')
+        plt.xlabel('Time (s)')
         plt.ylabel('Predicted Action')
         
         # Plot commitment levels
-        plt.subplot(2, 1, 2)
-        plt.plot(commitments, marker='o')
+        plt.subplot(3, 1, 2)
+        plt.plot(timestamps, commitments, marker='o')
         plt.title('Commitment Levels Over Time')
-        plt.xlabel('Time Window')
+        plt.xlabel('Time (s)')
         plt.ylabel('Commitment Level')
+        
+        # Plot detected intents
+        plt.subplot(3, 1, 3)
+        for intent in intents:
+            action, start_time, end_time = intent
+            plt.axvspan(start_time, end_time, alpha=0.3, label=action)
+        plt.title('Detected Intents')
+        plt.xlabel('Time (s)')
+        plt.ylabel('Intent')
+        plt.legend()
         
         plt.tight_layout()
         plt.show()
-
-    def build_tunable_model(self, hp):
-        input_shape = (250, 16)
-        input_cnn = Input(shape=input_shape)
-        x_cnn = Conv1D(hp.Int('conv_1_filter', min_value=32, max_value=128, step=32),
-                       hp.Int('conv_1_kernel', min_value=3, max_value=9, step=3),
-                       activation='relu')(input_cnn)
-        x_cnn = MaxPooling1D(pool_size=2)(x_cnn)
-        x_cnn = Conv1D(hp.Int('conv_2_filter', min_value=64, max_value=256, step=64),
-                       hp.Int('conv_2_kernel', min_value=3, max_value=9, step=3),
-                       activation='relu')(x_cnn)
-        x_cnn = MaxPooling1D(pool_size=2)(x_cnn)
-        x_cnn = LSTM(hp.Int('lstm_units', min_value=32, max_value=128, step=32), return_sequences=True)(x_cnn)
-        x_cnn = LSTM(hp.Int('lstm_units_2', min_value=16, max_value=64, step=16))(x_cnn)
         
-        input_transformer = Input(shape=input_shape)
-        x_transformer = input_transformer
-        for _ in range(hp.Int('num_transformer_blocks', 1, 3)):
-            x_transformer = MultiHeadAttention(num_heads=hp.Int('num_heads', 2, 8),
-                                               key_dim=hp.Int('key_dim', 16, 64, step=16))(x_transformer, x_transformer)
-            x_transformer = LayerNormalization(epsilon=1e-6)(x_transformer)
-            x_transformer = Conv1D(filters=hp.Int('conv_transformer_filters', 16, 64, step=16),
-                                   kernel_size=1, activation="relu")(x_transformer)
-            x_transformer = LayerNormalization(epsilon=1e-6)(x_transformer)
-        x_transformer = GlobalAveragePooling1D()(x_transformer)
-        
-        combined = Concatenate()([x_cnn, x_transformer])
-        combined = Dense(hp.Int('dense_units', 32, 128, step=32), activation='relu')(combined)
-        combined = Dropout(hp.Float('dropout', 0.1, 0.5, step=0.1))(combined)
-        output = Dense(len(self.actions), activation='softmax')(combined)
-        
-        model = Model(inputs=[input_cnn, input_transformer], outputs=output)
-        model.compile(
-            optimizer=Adam(hp.Float('learning_rate', 1e-4, 1e-2, sampling='LOG')),
-            loss='categorical_crossentropy',
-            metrics=['accuracy'])
-        
-        return model
-
-    def optimize_nn_model(self, X, y):
-        tuner = kt.Hyperband(self.build_tunable_model,
-                             objective='val_accuracy',
-                             max_epochs=50,
-                             factor=3,
-                             directory='my_dir',
-                             project_name='EEG_model_tuning')
-
-        stop_early = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5)
-        tuner.search([X, X], y, epochs=50, validation_split=0.2, callbacks=[stop_early])
-
-        best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
-        self.models['optimized_nn'] = tuner.hypermodel.build(best_hps)
-        return self.models['optimized_nn']
-    
-    def check_data_consistency(self):
-        self.log_and_emit("Data Consistency Summary:")
-        shapes = {}
-        sample_counts = {}
-        
-        if not self.actions:
-            self.log_and_emit("No actions available.")
-            return
-
-        for data_type in self.data.keys():
-            self.log_and_emit(f"\nChecking {data_type}:")
-            shapes[data_type] = {}
-            sample_counts[data_type] = {}
-            
-            for action in self.actions:
-                if action not in self.data[data_type]:
-                    self.log_and_emit(f"  Warning: No data found for action '{action}' in {data_type}")
-                    continue
-                shapes[data_type][action] = [sample.shape for sample in self.data[data_type][action]]
-                sample_counts[data_type][action] = len(shapes[data_type][action])
-
-            if not shapes[data_type]:
-                self.log_and_emit(f"  No valid data found for any action in {data_type}")
-                continue
-
-            # Summarize shape information
-            for action, action_shapes in shapes[data_type].items():
-                unique_shapes = set(action_shapes)
-                if len(unique_shapes) == 1:
-                    self.log_and_emit(f"  {action}: All {sample_counts[data_type][action]} samples have shape {unique_shapes.pop()}")
-                else:
-                    self.log_and_emit(f"  {action}: {sample_counts[data_type][action]} samples with {len(unique_shapes)} different shapes")
-                    self.log_and_emit(f"    Most common shape: {max(set(action_shapes), key=action_shapes.count)}")
-                    self.log_and_emit(f"    Unusual shapes:")
-                    for shape in unique_shapes:
-                        if action_shapes.count(shape) < 5:  # Arbitrary threshold for "unusual"
-                            self.log_and_emit(f"      {shape}: {action_shapes.count(shape)} occurrences")
-
-            # Check if all actions have the same number of samples
-            if len(set(sample_counts[data_type].values())) > 1:
-                self.log_and_emit(f"\n  Inconsistent number of samples across actions in {data_type}:")
-                for action, count in sample_counts[data_type].items():
-                    self.log_and_emit(f"    {action}: {count} samples")
-            elif sample_counts[data_type]:
-                self.log_and_emit(f"\n  All actions in {data_type} have {next(iter(sample_counts[data_type].values()))} samples")
-            else:
-                self.log_and_emit(f"\n  No sample count information available for {data_type}")
-
-            # Overall statistics for this data type
-            all_shapes = [shape for shapes_list in shapes[data_type].values() for shape in shapes_list]
-            total_samples = sum(sample_counts[data_type].values())
-            
-            if total_samples > 0:
-                standard_shape = (250, 16, 60)
-                standard_count = all_shapes.count(standard_shape)
-
-                self.log_and_emit(f"\n  Total samples in {data_type}: {total_samples}")
-                self.log_and_emit(f"  Samples with standard shape {standard_shape}: {standard_count} ({standard_count/total_samples*100:.2f}%)")
-                self.log_and_emit(f"  Samples with non-standard shapes: {total_samples - standard_count} ({(total_samples - standard_count)/total_samples*100:.2f}%)")
-            else:
-                self.log_and_emit(f"\n  No samples found in {data_type}")
-
-    def clean_and_balance_data(self):
-        self.log_and_emit("Cleaning and balancing data...")
-        if not self.actions or not self.data['raw_data']:
-            self.log_and_emit("No raw data available to clean and balance.")
-            return
-
-        cleaned_data = {}
-        sample_counts = {}
-
-        # Step 1: Remove non-standard shapes
-        for action in self.actions:
-            if action not in self.data['raw_data']:
-                self.log_and_emit(f"No raw data found for action: {action}")
-                continue
-            cleaned_data[action] = [sample for sample in self.data['raw_data'][action] if sample.shape == (250, 16, 60)]
-            sample_counts[action] = len(cleaned_data[action])
-            self.log_and_emit(f"{action}: {sample_counts[action]} samples after cleaning")
-
-        if not cleaned_data:
-            self.log_and_emit("No valid data remaining after cleaning.")
-            return
-
-        # Step 2: Balance the dataset
-        min_samples = min(sample_counts.values())
-        for action in self.actions:
-            if action not in cleaned_data:
-                continue
-            if len(cleaned_data[action]) > min_samples:
-                # Randomly select min_samples
-                indices = np.random.choice(len(cleaned_data[action]), min_samples, replace=False)
-                cleaned_data[action] = [cleaned_data[action][i] for i in indices]
-            self.log_and_emit(f"{action}: {len(cleaned_data[action])} samples after balancing")
-
-        # Update the framework's cleaned data
-        self.data['cleaned_data'] = cleaned_data
-
-        # Verify the results
-        shapes = {action: [sample.shape for sample in cleaned_data[action]] for action in cleaned_data}
-        self.log_and_emit("\nFinal data summary:")
-        for action, action_shapes in shapes.items():
-            shape_counts = Counter(action_shapes)
-            self.log_and_emit(f"{action}:")
-            for shape, count in shape_counts.items():
-                self.log_and_emit(f"  Shape {shape}: {count} samples")
-
-        self.log_and_emit("Data cleaning and balancing completed.")
-
     def run_analysis(self):
-        self.log_and_emit("Loading data...")
-        self.load_data()
+        try:
+            self.log_and_emit("Preparing data for model training...")
+            train_data = self.raw_data_generator('cleaned_data', self.batch_size)
+            val_data = self.raw_data_generator('validation_data', self.batch_size)
 
-        self.log_and_emit("Preprocessing data...")
-        self.preprocess_all_data()
+            self.log_and_emit("Training and optimizing models...")
+            self.integrated_training(epochs=10, batch_size=self.batch_size)
 
-        self.log_and_emit("Applying ICA...")
-        self.apply_ica()
+            self.log_and_emit("Evaluating models...")
+            for stack_size in range(1, self.max_stack_size + 1):
+                self.log_and_emit(f"Evaluating CNN-LSTM model for stack size {stack_size}")
+                self.evaluate_model(f'cnn_lstm_stack_{stack_size}', val_data)
+                
+                self.log_and_emit(f"Evaluating unsupervised models for stack size {stack_size}")
+                self.evaluate_unsupervised_models(stack_size, val_data)
 
-        self.log_and_emit("Clustering ICA components...")
-        self.cluster_ica_components()
+            self.log_and_emit("Analyzing intents and commitments...")
+            sample_val_data = next(val_data)[0]  # Get the first batch of validation data
+            predictions, commitments, timestamps = self.detect_intent(sample_val_data[0])  # Analyze first sample in batch
+            intents = self.analyze_intent_and_commitment(predictions, commitments, timestamps)
 
-        self.log_and_emit("Preparing data for model training...")
-        train_X, test_X, train_y, test_y = self.prepare_data_for_training()
+            self.log_and_emit("Visualizing results...")
+            self.visualize_intent_and_commitment(predictions, commitments, timestamps, intents)
 
-        self.log_and_emit("Training and optimizing Combined CNN-LSTM-Transformer model...")
-        self.train_combined_model(train_X, train_y, test_X, test_y)
+            self.log_and_emit("Analysis complete.")
+        except Exception as e:
+            self.log_and_emit(f"Error during analysis: {str(e)}", level=logging.ERROR)
+            raise
+    
+#     def analyze_feature_importance(self, X, y):
+#         if 'optimized_rf' in self.models:
+#             rf_model = self.models['optimized_rf']
+#             importances = rf_model.feature_importances_
+#             feature_names = [f"Feature_{i}" for i in range(X.shape[1])]
+#             importance_df = pd.DataFrame({'feature': feature_names, 'importance': importances})
+#             importance_df = importance_df.sort_values('importance', ascending=False)
+#             
+#             plt.figure(figsize=(10, 6))
+#             sns.barplot(x='importance', y='feature', data=importance_df.head(20))
+#             plt.title('Top 20 Most Important Features')
+#             plt.tight_layout()
+#             plt.show()
+#         else:
+#             print("Random Forest model not found. Please train the model first.")
 
-        self.log_and_emit("Training and optimizing Neural Network model...")
-        self.optimize_nn_model(train_X, train_y)
-
-        self.log_and_emit("Training and optimizing Random Forest model...")
-        self.train_rf_model(train_X.reshape(train_X.shape[0], -1), np.argmax(train_y, axis=1))
-
-        self.log_and_emit("Performing cross-validation...")
-        self.cross_validate_models(train_X, train_y)
-
-        self.log_and_emit("Evaluating Combined model...")
-        combined_results = self.evaluate_model('combined', test_X, test_y)
-
-        self.log_and_emit("Evaluating Optimized NN model...")
-        optimized_nn_results = self.evaluate_model('optimized_nn', test_X, test_y)
-
-        self.log_and_emit("Evaluating Random Forest model...")
-        rf_results = self.evaluate_model('rf', test_X.reshape(test_X.shape[0], -1), test_y)
-
-        self.log_and_emit("Analysis complete.")
-
-    def get_results(self):
-        return {
-            'actions': self.actions,
-            'model_performances': {
-                'combined': self.evaluate_model('combined', self.preprocessed_data, self.actions),
-                'optimized_nn': self.evaluate_model('optimized_nn', self.preprocessed_data, self.actions),
-                'rf': self.evaluate_model('rf', self.preprocessed_data, self.actions)
-            }
-        }
