@@ -12,3 +12,8 @@ EEG analysis integration
 
 Support for lightweight EEG devices
 
+### Notes
+
+Ensure the EEG device fits securely on the mouse.
+
+Regularly calibrate the EEG device for accurate readings.
